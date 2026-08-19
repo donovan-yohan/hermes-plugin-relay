@@ -1,0 +1,57 @@
+manifest_version: 2
+name: hermes-plugin-relay
+label: Relay Participants
+version: 0.1.0
+kind: standalone
+author: Nous Research
+description: >
+  External agent participants for Hermes. Claude Code, Codex and a built-in mock
+  adapter join a Hermes session as first-class attributed participants: a human
+  can @mention them from the composer, Hermes itself can call them through the
+  agent_message tool, and their replies stream into the same transcript as
+  durable, attributed rows rather than opaque tool output.
+
+  Provider subprocesses, resume ids and queueing stay backend-side; the Desktop
+  half only contributes @-completions and composer interception. External
+  participant output is treated as untrusted peer content and never gains
+  system/developer authority. Participant-to-participant chaining is off by
+  default and turn-capped when enabled.
+
+  Requires the Hermes participant seam (tui_gateway/participants.py). Without
+  it the plugin still loads, but participants report status "error" and the
+  tools return a visible error.
+
+# Declaring these is also what asks Hermes discovery to import tools.py in CLI
+# and TUI processes, where the plugin would otherwise be deferred.
+provides_tools:
+  - agent_participants_list
+  - agent_message
+  - agent_interrupt
+
+requires_env: []
+optional_env: []
+
+# Settings live under plugins.entries.hermes-plugin-relay.settings.* in
+# config.yaml. No HERMES_* environment variable configures behavior.
+config_schema:
+  participants:
+    type: list
+    description: >
+      Participant definitions, replacing the built-in claude/codex/mock trio.
+      Each entry: {id, handle, display_name, adapter, model?, cwd?, enabled?,
+      options?}. 'adapter' is one of claude, codex, mock.
+  chain:
+    type: dict
+    description: >
+      Participant-to-participant routing. {enabled: false, turn_cap: 2}. When
+      enabled, a participant reply mentioning another participant may dispatch
+      onward, bounded by turn_cap; self-mentions are ignored.
+  tool_timeout_seconds:
+    type: number
+    default: 300
+    description: How long agent_message blocks waiting for a participant turn.
+  cwd:
+    type: str
+    description: >
+      Default working directory for participant subprocesses. Falls back to the
+      Hermes session cwd, then the user's home directory.

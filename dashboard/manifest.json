@@ -1,0 +1,8 @@
+{
+  "name": "hermes-plugin-relay",
+  "label": "Relay Participants",
+  "description": "Backend for external agent participants (@claude, @codex) in the Hermes transcript.",
+  "icon": "Users",
+  "version": "0.1.0",
+  "api": "plugin_api.py"
+}

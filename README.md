@@ -220,9 +220,6 @@ cd /path/to/hermes-plugin-relay
 /path/to/hermes/.venv/bin/python -m pytest tests/ -q --ignore=tests/desktop
 ```
 
-On this machine that interpreter is
-`/home/donovanyohan/.hermes/hermes-agent/.venv/bin/python`.
-
 `tests/test_integration_seam.py` is the acceptance gate — streamed participant
 rows persist and rehydrate through the **real** core seam, a real `SessionDB`
 and a temp Hermes home. It skips unless you point it at a Hermes checkout:

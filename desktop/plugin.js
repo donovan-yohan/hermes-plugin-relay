@@ -1,645 +1,692 @@
 /**
- * hermes-plugin-relay — desktop half (participant seam contract v1.3, §9).
- *
- * Two contributions, no UI:
- *
- *   composer.atCompletions — `@claude`, `@codex`, … from the cached
- *     `GET /participants` roster. `provide()` is called per keystroke and MUST
- *     answer synchronously, so it only ever reads the cache; the fetch happens
- *     out of band (at register, on a 60s TTL, and whenever the backend says a
- *     participant turn started/finished).
- *
- *   composer.middleware — routes a submitted draft. `@claude do X` goes to the
- *     participant instead of Hermes; `@claude and @hermes do X` goes to BOTH
- *     (the participant via /dispatch, Hermes via the normal turn). Anything
- *     without a known external handle passes through untouched.
- *
- * Invariants this file is responsible for:
- *   - A message is NEVER lost, and never sent twice. Only a PRE-ACCEPTANCE
- *     refusal (4xx, or an `ok:false` body with no side-effect markers) passes
- *     the draft through to Hermes, because only there is it certain nothing was
- *     dispatched. A committed result — including a 200 `ok:false` partial —
- *     consumes the draft; an AMBIGUOUS failure (transport, timeout, 5xx)
- *     returns null so the composer restores it. Passing either of those through
- *     would duplicate the user row AND wake Hermes unaddressed.
- *   - One submit dispatches AT MOST once. Every attempt carries the same
- *     `dispatch_id`, which is what makes delivery exactly-once (the server's
- *     idempotency map, contract §6); the draft-identity guard on concurrent
- *     handler invocations is an optimization on top of it.
- *   - Participant output never re-enters this file. Only composer drafts reach
- *     the middleware; the gateway-event subscription below is roster-status
- *     invalidation only and cannot dispatch. Onward routing of participant
- *     text (chains) is a backend concern — see contract §10.
- *   - Nothing here throws. The SDK treats a throwing contribution as
- *     pass-through, but relying on that would make failures invisible; every
- *     entry point is explicitly guarded instead.
- *
- * Loaded UNCOMPILED as ESM in the renderer: no JSX, no TypeScript, and
- * `@hermes/plugin-sdk` is the only specifier that resolves (react is not
- * imported because this plugin renders nothing).
+ * Relay's native Desktop client. This is an uncompiled ESM disk plugin: it owns
+ * one full page and its sidebar entry, and talks only to its scoped plugin API.
  */
 
-import { COMPOSER_AREAS, host } from '@hermes/plugin-sdk'
+import {
+  Button,
+  EmptyState,
+  ErrorState,
+  Loader,
+  ROUTES_AREA,
+  SIDEBAR_NAV_AREA,
+  StatusDot,
+  Textarea,
+  cn
+} from '@hermes/plugin-sdk'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'hermes-plugin-relay'
+const RELAY_ROUTE = '/relay'
+const POLL_INTERVAL_MS = 3_000
+const HISTORY_LIMIT = 50
+const CONNECTION_STATES = new Set(['ready', 'offline', 'auth_required', 'error'])
 
-/** Hermes' own address. Never an external participant, even if a backend
- *  claims the handle — that would make "external mentions only" mis-route. */
-const HERMES_HANDLE = 'hermes'
+let pluginContext = null
 
-/** Dispatch outcomes. The distinction that matters is REJECTED (the server
- *  answered and declined, so NOTHING was dispatched) versus UNKNOWN (transport
- *  failure — the dispatch may or may not have landed). */
-const DISPATCH_ACCEPTED = 'accepted'
-const DISPATCH_REJECTED = 'rejected'
-const DISPATCH_UNKNOWN = 'unknown'
-
-const ROSTER_TTL_MS = 60_000
-/** After a failed roster fetch, retry sooner than the success TTL — a boot
- *  race with the backend shouldn't cost a full minute of dead completions. */
-const ROSTER_RETRY_MS = 5_000
-const ROSTER_TIMEOUT_MS = 5_000
-const DISPATCH_TIMEOUT_MS = 30_000
-const MAX_COMPLETIONS = 8
-
-/** Gateway events that can change a participant's `status` (ready ⇄ busy).
- *  The listener ONLY marks the roster stale — it must never dispatch. */
-const ROSTER_INVALIDATING_EVENTS = ['participant.message.start', 'participant.message.complete']
-
-// ── module state ─────────────────────────────────────────────────────────────
-
-let pluginCtx = null
-/** Normalized participants, in backend order. */
-let roster = []
-/** Lowercase handles of `roster`, for O(1) mention matching. */
-let rosterHandles = new Set()
-/** Freshness stamp of the last settled fetch (0 = stale/never). */
-let rosterCheckedAt = 0
-/** Whether that last settled fetch succeeded — picks the TTL to honour. */
-let rosterOk = false
-/** Whether ANY fetch has settled. Distinct from the freshness stamp, which an
- *  event invalidation resets: only the very first submit may wait on REST. */
-let rosterAttempted = false
-/** Single-flight guard for the roster fetch. */
-let rosterInFlight = null
-/** draft object → its one dispatch outcome. The no-double-dispatch guard;
- *  see dispatchOnce() for why identity, not text, is the key. */
-let attemptOutcomes = new WeakMap()
-/** Event-subscription disposers, released on ctx.onDispose. */
-let disposers = []
-
-// ── roster ───────────────────────────────────────────────────────────────────
-
-/**
- * Coerce one `GET /participants` row into the shape the rest of this file
- * uses. Returns null for anything unusable so a malformed backend row can't
- * poison mention matching.
- */
-function normalizeParticipant(raw) {
-  if (!raw || typeof raw !== 'object') {
-    return null
-  }
-
-  const handle = String(raw.handle == null ? '' : raw.handle)
-    .trim()
-    .replace(/^@+/, '')
-    .toLowerCase()
-
-  if (!/^[a-z0-9][a-z0-9_-]*$/.test(handle) || handle === HERMES_HANDLE) {
-    return null
-  }
-
-  const displayName = String(raw.display_name == null ? '' : raw.display_name).trim()
-
-  // Only what the two consumers need: the `@` menu row and mention matching.
-  // Dispatch addresses participants by handle (contract §6), so the backend's
-  // `id` / `adapter_id` / `capabilities` stay backend-side.
-  return {
-    displayName: displayName || handle,
-    handle,
-    status: String(raw.status == null ? 'offline' : raw.status)
-  }
+function text(value, fallback = '') {
+  return typeof value === 'string' ? value : fallback
 }
 
-function applyRoster(participants) {
-  roster = participants
-  rosterHandles = new Set(participants.map(participant => participant.handle))
+function errorMessage(error, fallback) {
+  const message = text(error?.message).trim()
+
+  return message || fallback
 }
 
-async function fetchRoster() {
-  const ctx = pluginCtx
-
-  if (!ctx || typeof ctx.rest !== 'function') {
-    throw new Error('plugin REST bridge unavailable')
-  }
-
-  const response = await ctx.rest('/participants', { timeoutMs: ROSTER_TIMEOUT_MS })
-  const rows = response && Array.isArray(response.participants) ? response.participants : []
-  const next = []
-  const seen = new Set()
-
-  for (const row of rows) {
-    const participant = normalizeParticipant(row)
-
-    if (participant && !seen.has(participant.handle)) {
-      seen.add(participant.handle)
-      next.push(participant)
-    }
-  }
-
-  applyRoster(next)
-}
-
-function rosterIsFresh() {
-  if (!rosterCheckedAt) {
-    return false
-  }
-
-  return Date.now() - rosterCheckedAt < (rosterOk ? ROSTER_TTL_MS : ROSTER_RETRY_MS)
-}
-
-/**
- * Resolve once the roster is fresh enough to answer with. Single-flight, and
- * it NEVER rejects: a failed fetch keeps the previous roster (an empty one on
- * a cold start), because a dead backend must degrade to "no external
- * participants", not to a broken composer.
- */
-function ensureRoster() {
-  if (rosterInFlight) {
-    return rosterInFlight
-  }
-
-  if (rosterIsFresh()) {
-    return Promise.resolve()
-  }
-
-  rosterInFlight = Promise.resolve()
-    .then(fetchRoster)
-    .then(
-      () => true,
-      () => false
-    )
-    .then(ok => {
-      rosterOk = ok
-      rosterAttempted = true
-      rosterCheckedAt = Date.now()
-      rosterInFlight = null
-    })
-
-  return rosterInFlight
-}
-
-/** Drop the freshness stamps so the next completion/submit refetches. */
-function invalidateRoster() {
-  rosterCheckedAt = 0
-}
-
-function participantMeta(participant) {
-  const suffix = participant.status && participant.status !== 'ready' ? ` · ${participant.status}` : ''
-
-  return `External · ${participant.displayName}${suffix}`
-}
-
-// ── mentions ─────────────────────────────────────────────────────────────────
-
-/** Fenced and inline code is quoted text, not an address. */
-function stripCode(text) {
-  return text.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`\n]*`/g, ' ')
-}
-
-/**
- * Every `@handle` in the draft that names a KNOWN participant, plus whether
- * Hermes itself was addressed. Case-insensitive, order-preserving, deduped.
- *
- * The leading `[^A-Za-z0-9_@]` guard is what keeps `user@example.com` from
- * reading as a mention of `@example`; matching against the live roster does
- * the rest, so an unknown `@handle` is left alone as ordinary prose.
- */
-function parseMentions(text) {
-  const mentions = []
-  let hermes = false
-
-  for (const match of stripCode(text).matchAll(/(^|[^A-Za-z0-9_@])@([A-Za-z0-9][A-Za-z0-9_-]*)/g)) {
-    const handle = match[2].toLowerCase()
-
-    if (handle === HERMES_HANDLE) {
-      hermes = true
-      continue
-    }
-
-    if (rosterHandles.has(handle) && !mentions.includes(handle)) {
-      mentions.push(handle)
-    }
-  }
-
-  return { hermes, mentions }
-}
-
-// ── dispatch ─────────────────────────────────────────────────────────────────
-
-/**
- * Runtime (gateway) session id of the chat the user is looking at, read at
- * call time — never cached, because focus moves between tiles without the
- * plugin hearing about it.
- */
-function focusedSessionId() {
-  try {
-    const state = host && host.state
-    const atom = state && state.focusedSessionId
-    const value = atom && typeof atom.get === 'function' ? atom.get() : null
-    const id = value == null ? '' : String(value).trim()
-
-    return id || null
-  } catch {
-    return null
-  }
-}
-
-function reportDispatchFailure(error, mentions, outcome) {
-  try {
-    const who = mentions.map(handle => `@${handle}`).join(', ') || 'the external participants'
-
-    host.notifyError(
-      error,
-      outcome === DISPATCH_REJECTED
-        ? `Relay could not reach ${who} — the message went to Hermes instead.`
-        : `Relay could not confirm the send to ${who} — your message was restored and nothing was sent to Hermes.`
-    )
-  } catch {
-    // Toasts are best-effort; losing one must not change routing.
-  }
-}
-
-/** Name one entry of a `failed[]` array — `{participant_id, error}` rows, per
- *  runtime/manager.py. '' for a row without an id, which the caller drops. */
-function failedLabel(entry) {
-  return String(entry?.participant_id ?? '')
-}
-
-/**
- * A committed partial: the send happened, some participants did not start.
- * A notice, not an error — the message was NOT lost and Hermes was not woken.
- */
-function reportPartialDispatch(response) {
-  try {
-    const failed = Array.isArray(response.failed) ? response.failed : []
-    const who = failed.map(failedLabel).filter(Boolean).join(', ')
-
-    host.notify({
-      kind: 'warning',
-      message: who
-        ? `${who} could not start. The rest of the message was sent.`
-        : String(response.error || 'Some participants could not start.'),
-      title: 'Relay: partial dispatch'
-    })
-  } catch {
-    // Toasts are best-effort; losing one must not change routing.
-  }
-}
-
-/**
- * HTTP status behind a `ctx.rest` rejection, or 0 when there isn't one.
- *
- * The desktop bridge rejects with `Error(`${statusCode}: ${body}`)` carrying a
- * `statusCode` property, but that property does not survive every IPC
- * boundary — the message does. Read both, and treat "no status" as a transport
- * failure rather than guessing.
- */
-function httpStatus(error) {
-  if (!error || typeof error !== 'object') {
-    return 0
-  }
-
-  const explicit = error.statusCode == null ? error.status : error.statusCode
+function statusCode(error) {
+  const explicit = error?.statusCode ?? error?.status
 
   if (Number.isInteger(explicit)) {
     return explicit
   }
 
-  const match = /(?:^|\D)([45]\d{2}):\s/.exec(String(error.message == null ? '' : error.message))
+  const match = /(?:^|\D)([45]\d{2})(?::|\s)/.exec(text(error?.message))
 
   return match ? Number(match[1]) : 0
 }
 
-/**
- * Opaque id for ONE submit attempt. The server's `(session_id, dispatch_id)`
- * idempotency map is what makes delivery exactly-once (contract §6); this side
- * only has to never mint a fresh id for a retry of the same attempt.
- */
-function newDispatchId() {
-  try {
-    const webcrypto = globalThis.crypto
+function isAuthError(error) {
+  const status = statusCode(error)
 
-    if (webcrypto && typeof webcrypto.randomUUID === 'function') {
-      return webcrypto.randomUUID()
+  return status === 401 || status === 403
+}
+
+function normalizeConnection(response) {
+  const status = typeof response === 'string' ? response : response?.status
+
+  if (!CONNECTION_STATES.has(status)) {
+    throw new Error('Relay returned an invalid connection status.')
+  }
+
+  return { message: text(response?.message), status }
+}
+
+function normalizeChannels(response) {
+  const rows = Array.isArray(response) ? response : response?.channels
+
+  if (!Array.isArray(rows)) {
+    throw new Error('Relay returned an invalid channel list.')
+  }
+
+  return rows.flatMap(row => {
+    const id = text(row?.id).trim()
+
+    if (!id) {
+      return []
     }
 
-    if (webcrypto && typeof webcrypto.getRandomValues === 'function') {
-      return Array.from(webcrypto.getRandomValues(new Uint8Array(16)), byte =>
-        byte.toString(16).padStart(2, '0')
-      ).join('')
+    return [{
+      archived: row?.archived === true || row?.status === 'archived',
+      id,
+      name: text(row?.name, text(row?.title, id)).trim() || id,
+      summary: text(row?.summary, text(row?.description))
+    }]
+  })
+}
+
+function normalizedAttribution(row) {
+  const candidate = text(row?.author?.type, text(row?.authorType, text(row?.author_type, text(row?.senderType, text(row?.sender_type, text(row?.role)))))).toLowerCase()
+  const kind = candidate === 'human' || candidate === 'agent' || candidate === 'system' ? candidate : 'system'
+  const name = text(row?.author?.displayName, text(row?.author?.display_name, text(row?.authorName, text(row?.author_name, text(row?.senderName, text(row?.sender_name)))))).trim()
+
+  return { kind, name }
+}
+
+function normalizeMessages(response) {
+  if (response?.archived === true || response?.status === 'archived') {
+    return { archived: true, messages: [] }
+  }
+
+  const rows = Array.isArray(response) ? response : response?.messages
+
+  if (!Array.isArray(rows)) {
+    throw new Error('Relay returned an invalid message history.')
+  }
+
+  return {
+    archived: false,
+    messages: rows.flatMap((row, index) => {
+      const id = text(row?.id, text(row?.messageId, `relay-message-${index}`)).trim()
+      const body = text(row?.text, text(row?.content))
+
+      if (!id || typeof body !== 'string') {
+        return []
+      }
+
+      return [{
+        attribution: normalizedAttribution(row),
+        id,
+        text: body,
+        timestamp: text(row?.createdAt, text(row?.created_at, text(row?.timestamp)))
+      }]
+    })
+  }
+}
+
+function newClientMessageId() {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === 'function') {
+      return globalThis.crypto.randomUUID()
     }
   } catch {
-    // Fall through: uniqueness is what this id needs, not unpredictability.
+    // A deterministic fallback is not needed; uniqueness within this page is.
   }
 
-  return `d-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+  return `relay-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
 }
 
-/**
- * Did this `ok:false` body leave side effects behind? (contract §6, v1.5)
- *
- * The server answers 200 `ok:false` for a COMMITTED partial failure — the human
- * row is already persisted and/or some participants are already streaming, and
- * only the rest failed to queue. `user_row_appended` and a non-empty `turns`
- * are the markers. Treating that as a rejection and passing the draft through
- * would duplicate the user row AND wake Hermes unaddressed.
- */
-function isCommittedResult(response) {
-  return response.user_row_appended === true || (Array.isArray(response.turns) && response.turns.length > 0)
+function emptyHistory() {
+  return { archived: false, error: '', loading: false, messages: [] }
 }
 
-/**
- * One POST, classified:
- *   accepted — the server took it, wholly or partly. A partial result carries
- *              `partial` so the caller can say which participants failed;
- *   rejected — the server answered and declined BEFORE any side effect (4xx, or
- *              an `ok:false` body with no side-effect markers). Nothing was
- *              dispatched, so the draft may still go to Hermes;
- *   unknown  — transport failure, timeout, or 5xx. The dispatch may or may not
- *              have been accepted; the caller must not assume either way.
- * Never rejects.
- */
-async function attemptDispatch(ctx, body) {
+function safeStorageGet(ctx) {
   try {
-    const response = await ctx.rest('/dispatch', { body, method: 'POST', timeoutMs: DISPATCH_TIMEOUT_MS })
+    const value = ctx?.storage?.get?.('relay.selection.channelId', '')
 
-    if (response && response.ok === false) {
-      return isCommittedResult(response)
-        ? { outcome: DISPATCH_ACCEPTED, partial: response }
-        : { error: new Error(String(response.error || 'dispatch refused')), outcome: DISPATCH_REJECTED }
-    }
-
-    return { outcome: DISPATCH_ACCEPTED }
-  } catch (error) {
-    const status = httpStatus(error)
-
-    return { error, outcome: status >= 400 && status < 500 ? DISPATCH_REJECTED : DISPATCH_UNKNOWN }
+    return text(value).trim()
+  } catch {
+    return ''
   }
 }
 
-/**
- * POST /dispatch for ONE submit attempt. An ambiguous attempt is retried once
- * with the same `dispatch_id`, so a duplicate arrival collapses server-side
- * into the same turns (contract §6). Resolves to a DISPATCH_* outcome and
- * never rejects.
- */
-function dispatch(sessionId, text, mentions, appendUserMessage) {
-  const ctx = pluginCtx
-  // Minted once, here. Every attempt below reuses it verbatim.
-  const body = {
-    append_user_message: appendUserMessage,
-    dispatch_id: newDispatchId(),
-    mentions,
-    session_id: sessionId,
-    text
+function safeStorageSet(ctx, channelId) {
+  try {
+    ctx?.storage?.set?.('relay.selection.channelId', channelId)
+  } catch {
+    // Selection is a convenience, never a prerequisite for Relay access.
   }
-
-  return (async () => {
-    if (!ctx || typeof ctx.rest !== 'function') {
-      // No bridge at all: no request left this machine, so nothing can be
-      // half-dispatched. Definite, and safe to pass through to Hermes.
-      reportDispatchFailure(new Error('plugin REST bridge unavailable'), mentions, DISPATCH_REJECTED)
-
-      return DISPATCH_REJECTED
-    }
-
-    let attempt = await attemptDispatch(ctx, body)
-
-    if (attempt.outcome === DISPATCH_UNKNOWN) {
-      attempt = await attemptDispatch(ctx, body)
-    }
-
-    // Exactly one notice per submit, never one per attempt.
-    if (attempt.outcome !== DISPATCH_ACCEPTED) {
-      reportDispatchFailure(attempt.error, mentions, attempt.outcome)
-    } else if (attempt.partial) {
-      reportPartialDispatch(attempt.partial)
-    }
-
-    return attempt.outcome
-  })().catch(() => DISPATCH_UNKNOWN)
 }
 
-/**
- * One dispatch per draft attempt, keyed by the draft OBJECT.
- *
- * The composer builds a fresh draft per submit, so object identity is attempt
- * identity: concurrent invocations of the same attempt join one POST, while a
- * deliberate re-send — a new draft object, even with byte-identical text — is a
- * new attempt with a fresh `dispatch_id`. Keying by text instead would silently
- * swallow a genuine re-send.
- *
- * The entry is kept after settling (a draft object dispatches at most once,
- * ever) and the WeakMap lets it vanish with the draft. This is an optimization
- * on top of the server's idempotency map, never the correctness mechanism.
- *
- * Only reachable with an object draft: routeDraft returns early unless
- * `draft.text` is a non-empty string.
- */
-function dispatchOnce(draft, sessionId, text, mentions, appendUserMessage) {
-  const pending = attemptOutcomes.get(draft)
-
-  if (pending) {
-    return pending
+function ConnectionBanner({ connection, onAuthorize, onRetry, pending }) {
+  const copy = {
+    auth_required: {
+      action: 'Authorize Relay',
+      body: 'Relay needs authorization before channels can be updated.',
+      title: 'Authorization required'
+    },
+    error: {
+      action: 'Retry connection',
+      body: connection.message || 'Relay returned a recoverable connection error.',
+      title: 'Relay needs attention'
+    },
+    loading: {
+      body: 'Checking the Relay connection…',
+      title: 'Connecting to Relay'
+    },
+    offline: {
+      action: 'Retry connection',
+      body: 'Showing cached transcript data. Your draft is preserved and sending is paused.',
+      title: 'Relay is offline'
+    },
+    ready: {
+      body: 'Channel updates are live.',
+      title: 'Relay connected'
+    }
+  }[connection.status] || {
+    action: 'Retry connection',
+    body: 'Relay returned an unknown state.',
+    title: 'Relay needs attention'
   }
 
-  const settled = dispatch(sessionId, text, mentions, appendUserMessage)
+  const action = connection.status === 'auth_required' ? onAuthorize : onRetry
 
-  attemptOutcomes.set(draft, settled)
-
-  return settled
+  return jsxs('section', {
+    'aria-live': 'polite',
+    className: cn(
+      'flex shrink-0 items-center justify-between gap-3 border-b border-(--ui-stroke-tertiary) px-4 py-2 text-sm',
+      connection.status === 'ready' ? 'text-(--ui-text-secondary)' : 'text-(--ui-text-primary)'
+    ),
+    'data-connection': connection.status,
+    role: 'status',
+    children: [
+      jsxs('div', {
+        className: 'flex min-w-0 items-center gap-2',
+        children: [
+          jsx(StatusDot, { tone: connection.status === 'ready' ? 'good' : connection.status === 'offline' ? 'bad' : 'warn' }),
+          jsxs('div', {
+            className: 'min-w-0',
+            children: [
+              jsx('div', { className: 'font-medium', children: copy.title }),
+              jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: copy.body })
+            ]
+          })
+        ]
+      }),
+      copy.action
+        ? jsx(Button, {
+            disabled: pending,
+            onClick: () => void action(),
+            size: 'sm',
+            type: 'button',
+            variant: 'secondary',
+            children: pending ? 'Working…' : copy.action
+          })
+        : null
+    ]
+  })
 }
 
-/**
- * The routing decision, contract §9:
- *
- *   no known external mention  → pass through (Hermes handles it)
- *   external + @hermes         → dispatch (append_user_message:false), then
- *                                pass through (the Hermes turn runs and
- *                                persists the human row itself)
- *   external only              → dispatch (append_user_message:true), consume
- *                                the draft ({handled:true})
- *   committed partial failure  → same as accepted: the send happened, some
- *                                participants did not start (one notice)
- *   pre-acceptance refusal     → pass through: nothing was dispatched, so the
- *                                text still lands with Hermes
- *   ambiguous failure          → null: the composer restores the draft rather
- *                                than risk a double send
- */
-async function routeDraft(draft) {
-  const text = draft && typeof draft.text === 'string' ? draft.text : ''
-
-  if (!text || text.indexOf('@') === -1) {
-    return draft
+function ChannelList({ channels, error, loading, onRetry, onSelect, selectedChannelId }) {
+  if (loading && channels.length === 0) {
+    return jsx('div', { className: 'flex flex-1 items-center justify-center', children: jsx(Loader, {}) })
   }
 
-  if (rosterAttempted) {
-    // Warm: answer from cache and refresh for next time. A submit must never
-    // wait on REST once we've talked to the backend at least once.
-    void ensureRoster()
-  } else {
-    // Never resolved a roster: this submit is the right moment to pay for it,
-    // bounded by the REST timeout, and exactly once per plugin load.
-    await ensureRoster()
+  if (error && channels.length === 0) {
+    return jsx(ErrorState, {
+      action: jsx(Button, { onClick: () => void onRetry(), size: 'sm', type: 'button', variant: 'secondary', children: 'Retry channels' }),
+      description: error,
+      title: 'Channels could not be loaded'
+    })
   }
 
-  const { hermes, mentions } = parseMentions(text)
-
-  if (!mentions.length) {
-    return draft
+  if (channels.length === 0) {
+    return jsx(EmptyState, {
+      description: 'Connect or authorize Relay, then retry to load the channels available to you.',
+      title: 'No Relay channels yet'
+    })
   }
 
-  const sessionId = focusedSessionId()
-
-  if (!sessionId) {
-    // A draft with no live session has nowhere to dispatch to; the normal
-    // submit path is what creates the session.
-    return draft
-  }
-
-  const appendUserMessage = !hermes
-  const outcome = await dispatchOnce(draft, sessionId, text, mentions, appendUserMessage)
-
-  if (outcome === DISPATCH_UNKNOWN) {
-    // The dispatch may already have landed. Passing through would risk waking
-    // Hermes AND duplicating the participant send, so cancel instead: the
-    // composer restores the draft and the human decides whether to re-send.
-    return null
-  }
-
-  return appendUserMessage && outcome === DISPATCH_ACCEPTED ? { handled: true } : draft
+  return jsxs('div', {
+    className: 'flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto px-2 py-2',
+    children: [
+      error
+        ? jsxs('div', {
+            className: 'mb-1 flex items-center justify-between gap-2 px-2 text-xs text-(--ui-text-tertiary)',
+            children: [jsx('span', { children: error }), jsx(Button, { onClick: () => void onRetry(), size: 'xs', type: 'button', variant: 'text', children: 'Retry' })]
+          })
+        : null,
+      ...channels.map(channel =>
+        jsx(Button, {
+          'aria-current': channel.id === selectedChannelId ? 'page' : undefined,
+          className: cn('h-auto justify-start px-2 py-2 text-left', channel.id === selectedChannelId && 'bg-(--chrome-action-hover)'),
+          'data-channel-id': channel.id,
+          onClick: () => void onSelect(channel.id),
+          type: 'button',
+          variant: 'ghost',
+          children: jsxs('span', {
+            className: 'min-w-0',
+            children: [
+              jsxs('span', { className: 'block truncate text-sm', children: [channel.name, channel.archived ? ' · archived' : ''] }),
+              channel.summary ? jsx('span', { className: 'block truncate text-xs text-(--ui-text-tertiary)', children: channel.summary }) : null
+            ]
+          })
+        }, channel.id)
+      )
+    ]
+  })
 }
 
-// ── plugin ───────────────────────────────────────────────────────────────────
+function MessageRow({ message }) {
+  const label = message.attribution.name || message.attribution.kind
+
+  return jsxs('article', {
+    className: 'border-b border-(--ui-stroke-tertiary) px-4 py-3 last:border-b-0',
+    'data-attribution': message.attribution.kind,
+    'data-message-id': message.id,
+    children: [
+      jsxs('header', {
+        className: 'mb-1 flex items-center gap-2 text-xs text-(--ui-text-tertiary)',
+        children: [jsx('span', { className: 'font-medium uppercase tracking-wide', children: label }), message.timestamp ? jsx('time', { children: message.timestamp }) : null]
+      }),
+      jsx('div', { className: 'whitespace-pre-wrap break-words text-sm text-(--ui-text-primary)', children: message.text })
+    ]
+  })
+}
+
+function Transcript({ channel, entry, onRetry }) {
+  if (!channel) {
+    return jsx(EmptyState, { description: 'Choose a Relay channel to inspect its messages.', title: 'Select a channel' })
+  }
+
+  if (entry.loading && entry.messages.length === 0) {
+    return jsx('div', { className: 'flex flex-1 items-center justify-center', children: jsx(Loader, {}) })
+  }
+
+  if (channel.archived || entry.archived) {
+    return jsx(EmptyState, {
+      description: 'This channel is archived. Its previous messages remain available when Relay returns them.',
+      title: 'Channel archived'
+    })
+  }
+
+  if (entry.error && entry.messages.length === 0) {
+    return jsx(ErrorState, {
+      action: jsx(Button, { onClick: () => void onRetry(), size: 'sm', type: 'button', variant: 'secondary', children: 'Retry history' }),
+      description: entry.error,
+      title: 'Transcript could not be loaded'
+    })
+  }
+
+  if (entry.messages.length === 0) {
+    return jsx(EmptyState, { description: 'Send the first message when Relay is ready.', title: 'No messages in this channel yet' })
+  }
+
+  return jsxs('div', {
+    className: 'min-h-0 flex-1 overflow-y-auto',
+    children: [
+      entry.error
+        ? jsxs('div', {
+            className: 'flex items-center justify-between gap-2 border-b border-(--ui-stroke-tertiary) px-4 py-2 text-xs text-(--ui-text-tertiary)',
+            children: [jsx('span', { children: entry.error }), jsx(Button, { onClick: () => void onRetry(), size: 'xs', type: 'button', variant: 'text', children: 'Retry' })]
+          })
+        : null,
+      ...entry.messages.map(message => jsx(MessageRow, { message }, message.id))
+    ]
+  })
+}
+
+function RelayPage() {
+  const ctx = pluginContext
+  const [connection, setConnection] = useState({ message: '', status: 'loading' })
+  const [channels, setChannels] = useState([])
+  const [channelError, setChannelError] = useState('')
+  const [selectedChannelId, setSelectedChannelId] = useState('')
+  const [history, setHistory] = useState({})
+  const [draft, setDraft] = useState('')
+  const [pending, setPending] = useState(false)
+  const [sending, setSending] = useState(false)
+  const [retry, setRetry] = useState(null)
+
+  const connectionRef = useRef(connection)
+  const selectedRef = useRef(selectedChannelId)
+  const historyRef = useRef(history)
+  const historyGeneration = useRef(0)
+  const storedSelectionRead = useRef(false)
+  const retryRef = useRef(null)
+
+  connectionRef.current = connection
+  selectedRef.current = selectedChannelId
+  historyRef.current = history
+
+  const patchHistory = useCallback((channelId, patch) => {
+    const current = historyRef.current[channelId] || emptyHistory()
+    const nextEntry = typeof patch === 'function' ? patch(current) : { ...current, ...patch }
+    const next = { ...historyRef.current, [channelId]: nextEntry }
+
+    historyRef.current = next
+    setHistory(next)
+  }, [])
+
+  const noteAuthRequired = useCallback(error => {
+    if (isAuthError(error)) {
+      setConnection({ message: '', status: 'auth_required' })
+
+      return true
+    }
+
+    return false
+  }, [])
+
+  const loadHistory = useCallback(async channelId => {
+    if (!channelId || typeof ctx?.rest !== 'function') {
+      return
+    }
+
+    const generation = ++historyGeneration.current
+    patchHistory(channelId, current => ({ ...current, error: '', loading: true }))
+
+    try {
+      const response = await ctx.rest(`/channels/${encodeURIComponent(channelId)}/messages?limit=${HISTORY_LIMIT}`)
+      const normalized = normalizeMessages(response)
+
+      if (generation !== historyGeneration.current || channelId !== selectedRef.current) {
+        return
+      }
+
+      patchHistory(channelId, { ...emptyHistory(), archived: normalized.archived, messages: normalized.messages })
+    } catch (error) {
+      if (generation !== historyGeneration.current || channelId !== selectedRef.current) {
+        return
+      }
+
+      const authRequired = noteAuthRequired(error)
+      patchHistory(channelId, current => ({
+        ...current,
+        error: authRequired ? 'Relay authorization is required to refresh this transcript.' : errorMessage(error, 'Relay could not refresh this transcript.'),
+        loading: false
+      }))
+    }
+  }, [ctx, noteAuthRequired, patchHistory])
+
+  const chooseChannel = useCallback(async channelId => {
+    if (!channelId) {
+      return
+    }
+
+    selectedRef.current = channelId
+    historyGeneration.current += 1
+    setSelectedChannelId(channelId)
+    safeStorageSet(ctx, channelId)
+    await loadHistory(channelId)
+  }, [ctx, loadHistory])
+
+  const refreshPage = useCallback(async () => {
+    if (typeof ctx?.rest !== 'function') {
+      setConnection({ message: 'Relay’s local API bridge is unavailable.', status: 'error' })
+
+      return
+    }
+
+    setPending(true)
+
+    try {
+      const status = normalizeConnection(await ctx.rest('/connection/status'))
+
+      setConnection(status)
+      if (status.status !== 'ready') {
+        return
+      }
+
+      try {
+        const nextChannels = normalizeChannels(await ctx.rest('/channels'))
+
+        setChannels(nextChannels)
+        setChannelError('')
+
+        if (!storedSelectionRead.current) {
+          storedSelectionRead.current = true
+          const stored = safeStorageGet(ctx)
+
+          if (stored && nextChannels.some(channel => channel.id === stored)) {
+            selectedRef.current = stored
+            setSelectedChannelId(stored)
+          }
+        }
+
+        const selected = nextChannels.some(channel => channel.id === selectedRef.current)
+          ? selectedRef.current
+          : nextChannels[0]?.id || ''
+
+        if (selected) {
+          await chooseChannel(selected)
+        } else {
+          selectedRef.current = ''
+          setSelectedChannelId('')
+        }
+      } catch (error) {
+        if (noteAuthRequired(error)) {
+          return
+        }
+
+        setChannelError(errorMessage(error, 'Relay could not refresh channels.'))
+      }
+    } catch (error) {
+      if (!noteAuthRequired(error)) {
+        setConnection({ message: errorMessage(error, 'Relay could not check the connection.'), status: 'error' })
+      }
+    } finally {
+      setPending(false)
+    }
+  }, [chooseChannel, ctx, noteAuthRequired])
+
+  const refreshLatest = useCallback(async () => {
+    if (connectionRef.current.status === 'ready' && selectedRef.current) {
+      await loadHistory(selectedRef.current)
+    }
+  }, [loadHistory])
+
+  const authorize = useCallback(async () => {
+    if (typeof ctx?.rest !== 'function') {
+      setConnection({ message: 'Relay’s local API bridge is unavailable.', status: 'error' })
+
+      return
+    }
+
+    setPending(true)
+
+    try {
+      await ctx.rest('/connection/authorize', { method: 'POST' })
+      await refreshPage()
+    } catch (error) {
+      if (!noteAuthRequired(error)) {
+        setConnection({ message: errorMessage(error, 'Relay authorization could not be started.'), status: 'error' })
+      }
+    } finally {
+      setPending(false)
+    }
+  }, [ctx, noteAuthRequired, refreshPage])
+
+  const send = useCallback(async manualRetry => {
+    const channelId = selectedRef.current
+    const retryAttempt = manualRetry ? retryRef.current : null
+    const messageText = retryAttempt?.text ?? draft.trim()
+    const clientMessageId = retryAttempt?.clientMessageId ?? newClientMessageId()
+
+    if (!channelId || !messageText || connectionRef.current.status !== 'ready' || typeof ctx?.rest !== 'function') {
+      return
+    }
+
+    setSending(true)
+
+    try {
+      const response = await ctx.rest(`/channels/${encodeURIComponent(channelId)}/messages`, {
+        body: { clientMessageId, format: 'markdown', text: messageText },
+        method: 'POST'
+      })
+
+      if (response?.ok === false) {
+        throw new Error(text(response.error, 'Relay did not accept this message.'))
+      }
+
+      retryRef.current = null
+      setRetry(null)
+      setDraft('')
+    } catch (error) {
+      const attempt = { channelId, clientMessageId, text: messageText }
+
+      retryRef.current = attempt
+      setRetry({ ...attempt, error: isAuthError(error) ? 'Relay authorization is required before sending.' : errorMessage(error, 'Relay could not confirm this message. Retry safely with the same message id.') })
+      noteAuthRequired(error)
+    } finally {
+      setSending(false)
+      // An accepted post (or an ambiguous transport result) can change history.
+      void loadHistory(channelId)
+    }
+  }, [ctx, draft, loadHistory, noteAuthRequired])
+
+  useEffect(() => {
+    void refreshPage()
+  }, [refreshPage])
+
+  useEffect(() => {
+    if (typeof ctx?.socket !== 'function') {
+      return undefined
+    }
+
+    try {
+      return ctx.socket('/events', () => {
+        void refreshLatest()
+      })
+    } catch {
+      return undefined
+    }
+  }, [ctx, refreshLatest])
+
+  useEffect(() => {
+    if (connection.status !== 'ready' || !selectedChannelId) {
+      return undefined
+    }
+
+    const timer = setInterval(() => {
+      void refreshLatest()
+    }, POLL_INTERVAL_MS)
+
+    return () => clearInterval(timer)
+  }, [connection.status, refreshLatest, selectedChannelId])
+
+  const selectedChannel = channels.find(channel => channel.id === selectedChannelId) || null
+  const transcript = history[selectedChannelId] || emptyHistory()
+  const canSend = Boolean(selectedChannel) && !selectedChannel.archived && !transcript.archived && connection.status === 'ready' && !sending
+  const composerHint = selectedChannel?.archived || transcript.archived
+    ? 'This channel is archived.'
+    : connection.status === 'offline'
+      ? 'Relay is offline. Your draft is preserved until it reconnects.'
+      : connection.status === 'auth_required'
+        ? 'Authorize Relay before sending.'
+        : 'Write a message…'
+
+  return jsxs('main', {
+    'aria-label': 'Relay channels',
+    className: 'flex h-full min-h-0 flex-col text-(--ui-text-primary)',
+    children: [
+      jsx(ConnectionBanner, { connection, onAuthorize: authorize, onRetry: refreshPage, pending }),
+      jsxs('div', {
+        className: 'flex min-h-0 flex-1 flex-col md:flex-row',
+        children: [
+          jsxs('aside', {
+            'aria-label': 'Relay channels',
+            className: 'flex min-h-36 shrink-0 flex-col border-b border-(--ui-stroke-tertiary) md:w-72 md:border-r md:border-b-0',
+            children: [
+              jsx('div', { className: 'px-4 pt-4 text-xs font-medium uppercase tracking-wide text-(--ui-text-tertiary)', children: 'Channels' }),
+              jsx(ChannelList, { channels, error: channelError, loading: pending && channels.length === 0, onRetry: refreshPage, onSelect: chooseChannel, selectedChannelId })
+            ]
+          }),
+          jsxs('section', {
+            'aria-label': selectedChannel ? `${selectedChannel.name} transcript` : 'Relay transcript',
+            className: 'flex min-h-0 min-w-0 flex-1 flex-col',
+            children: [
+              jsxs('header', {
+                className: 'flex shrink-0 items-center justify-between gap-3 border-b border-(--ui-stroke-tertiary) px-4 py-3',
+                children: [
+                  jsxs('div', {
+                    className: 'min-w-0',
+                    children: [jsx('h1', { className: 'truncate text-sm font-medium', children: selectedChannel?.name || 'Relay' }), selectedChannel?.summary ? jsx('p', { className: 'truncate text-xs text-(--ui-text-tertiary)', children: selectedChannel.summary }) : null]
+                  }),
+                  jsx(Button, { disabled: pending, onClick: () => void refreshPage(), size: 'sm', type: 'button', variant: 'ghost', children: 'Refresh' })
+                ]
+              }),
+              jsx(Transcript, { channel: selectedChannel, entry: transcript, onRetry: refreshLatest }),
+              jsxs('form', {
+                className: 'shrink-0 border-t border-(--ui-stroke-tertiary) p-4',
+                onSubmit: event => {
+                  event.preventDefault()
+                  void send(false)
+                },
+                children: [
+                  retry
+                    ? jsxs('div', {
+                        className: 'mb-2 flex items-center justify-between gap-3 text-xs text-(--ui-text-secondary)',
+                        role: 'alert',
+                        children: [
+                          jsx('span', { children: retry.error }),
+                          jsx(Button, { 'data-testid': 'retry-send', disabled: !canSend || retry.channelId !== selectedChannelId, onClick: () => void send(true), size: 'xs', type: 'button', variant: 'secondary', children: 'Retry send' })
+                        ]
+                      })
+                    : null,
+                  jsx(Textarea, {
+                    'aria-label': 'Relay message',
+                    disabled: !selectedChannel || connection.status !== 'ready' || Boolean(selectedChannel?.archived || transcript.archived),
+                    onChange: event => setDraft(text(event?.target?.value)),
+                    onKeyDown: event => {
+                      if ((event?.metaKey || event?.ctrlKey) && event?.key === 'Enter' && canSend) {
+                        event.preventDefault()
+                        void send(false)
+                      }
+                    },
+                    placeholder: composerHint,
+                    readOnly: connection.status !== 'ready',
+                    rows: 3,
+                    value: draft
+                  }),
+                  jsxs('div', {
+                    className: 'mt-2 flex items-center justify-between gap-3',
+                    children: [
+                      jsx('p', { className: 'text-xs text-(--ui-text-tertiary)', children: canSend ? 'Sends Markdown to Relay.' : composerHint }),
+                      jsx(Button, { disabled: !canSend || !draft.trim(), type: 'submit', children: sending ? 'Sending…' : 'Send' })
+                    ]
+                  })
+                ]
+              })
+            ]
+          })
+        ]
+      })
+    ]
+  })
+}
 
 export default {
-  /** Opt-in on both halves — the unified-package loader already caps this
-   *  root at false; stating it keeps the promise if the folder is ever
-   *  dropped into `desktop-plugins/` directly. */
   defaultEnabled: false,
-  description:
-    'Route @claude / @codex mentions in the composer to external agent participants, and offer their handles in the @ menu.',
+  description: 'Native Relay channel client for Hermes Desktop.',
   id: PLUGIN_ID,
-  name: 'Relay Participants',
-
+  name: 'Relay',
   register(ctx) {
-    // Hot reload re-runs register with a fresh ctx; start from a clean slate.
-    pluginCtx = ctx
-    roster = []
-    rosterHandles = new Set()
-    rosterAttempted = false
-    rosterCheckedAt = 0
-    rosterOk = false
-    rosterInFlight = null
-    attemptOutcomes = new WeakMap()
-    disposers = []
-
-    // Warm the cache so the first `@` keystroke already has handles. The
-    // backend may be disabled (`plugins.enabled` in config.yaml) — that is a
-    // supported state, not an error, so this can only ever no-op.
-    try {
-      void ensureRoster()
-    } catch {
-      // ensureRoster never throws, but register must survive even if it did.
-    }
-
-    // Participant activity changes `status`; mark the roster stale so the next
-    // completion or submit re-reads it. This listener CANNOT dispatch — that
-    // is the recursion suppression on this side of the seam.
-    try {
-      if (host && typeof host.onEvent === 'function') {
-        for (const type of ROSTER_INVALIDATING_EVENTS) {
-          const off = host.onEvent(type, invalidateRoster)
-
-          if (typeof off === 'function') {
-            disposers.push(off)
-          }
-        }
+    pluginContext = ctx
+    ctx.registerMany([
+      {
+        area: ROUTES_AREA,
+        data: { path: RELAY_ROUTE },
+        id: 'page',
+        render: () => jsx(RelayPage, {})
+      },
+      {
+        area: SIDEBAR_NAV_AREA,
+        data: { codicon: 'comment-discussion', label: 'Relay', path: RELAY_ROUTE },
+        id: 'nav',
+        order: 55
       }
-    } catch {
-      // No event tap → the TTL alone keeps the roster honest.
-    }
-
-    ctx.register({
-      area: COMPOSER_AREAS.atCompletions,
-      data: {
-        /** Called per keystroke — cache reads only, no awaits, no throws. */
-        provide: query => {
-          try {
-            // Fire-and-forget: refreshes a stale cache for the NEXT keystroke.
-            void ensureRoster()
-
-            const q = String(query == null ? '' : query)
-              .trim()
-              .replace(/^@+/, '')
-              .toLowerCase()
-            const items = []
-
-            for (const participant of roster) {
-              if (q && !participant.handle.startsWith(q)) {
-                continue
-              }
-
-              items.push({
-                display: `@${participant.handle}`,
-                insert: `@${participant.handle}`,
-                meta: participantMeta(participant)
-              })
-
-              if (items.length >= MAX_COMPLETIONS) {
-                break
-              }
-            }
-
-            return items
-          } catch {
-            return []
-          }
-        }
-      },
-      id: 'participant-completions'
-    })
-
-    ctx.register({
-      area: COMPOSER_AREAS.middleware,
-      data: {
-        handler: async draft => {
-          try {
-            return await routeDraft(draft)
-          } catch {
-            // Last line of defence for the never-lose-a-message invariant.
-            return draft
-          }
-        }
-      },
-      id: 'participant-router'
-    })
-
-    if (typeof ctx.onDispose === 'function') {
-      ctx.onDispose(() => {
-        for (const off of disposers) {
-          try {
-            off()
-          } catch {
-            // Already gone.
-          }
-        }
-
-        disposers = []
-        attemptOutcomes = new WeakMap()
-        pluginCtx = null
-      })
-    }
+    ])
   }
 }

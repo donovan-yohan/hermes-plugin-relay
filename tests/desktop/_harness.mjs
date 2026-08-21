@@ -1,135 +1,354 @@
-/**
- * Shared loader for the desktop-half tests.
- *
- * The plugin is loaded the way the renderer loads it: as ESM, uncompiled, with
- * `@hermes/plugin-sdk` swapped for a per-test stub. The swap is a string
- * rewrite of the single import line into a prelude that reads the stub off
- * globalThis, and the rewritten source is imported as a `data:` URL — so every
- * load is a FRESH module instance (module-level roster and dispatch state
- * included) and no node flags are needed.
- *
- * Underscore-prefixed so neither `node --test 'tests/desktop/**\/*.test.mjs'`
- * nor bare `node --test` mistakes it for a suite.
- */
+/** Shared uncompiled-ESM loader and tiny hook renderer for Relay Desktop tests. */
 
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
 const SOURCE = readFileSync(new URL('../../desktop/plugin.js', import.meta.url), 'utf8')
-const SDK_IMPORT = /^import \{[^}]*\} from '@hermes\/plugin-sdk'\r?\n/m
+const SDK_IMPORT = /import \{[\s\S]*?\} from '@hermes\/plugin-sdk'\r?\n/
+const REACT_IMPORT = /import \{[\s\S]*?\} from 'react'\r?\n/
+const JSX_IMPORT = /import \{[\s\S]*?\} from 'react\/jsx-runtime'\r?\n/
 
-let seq = 0
+let sequence = 0
 
-/** Let every pending microtask AND the stubbed REST promises settle. */
 export const flush = () => new Promise(resolve => setImmediate(resolve))
 
-/**
- * Register the plugin against stubbed SDK + ctx surfaces.
- *
- * @param participants roster returned by `GET /participants` (default: none)
- * @param dispatch     handler for `POST /dispatch`, receives the request body
- * @param rest         full `ctx.rest` override; wins over the two above
- * @param sessionId    `host.state.focusedSessionId`, a value or a getter
- */
-export async function loadPlugin({ dispatch, participants = [], rest, sessionId = 'sess-1' } = {}) {
-  const calls = []
-  const registrations = []
-  const notifications = []
-  const notices = []
-  const listeners = new Map()
+export function textContent(node) {
+  if (node == null || node === false) {
+    return ''
+  }
 
-  const stubHost = {
-    notify: input => {
-      notices.push(input)
+  if (typeof node === 'string' || typeof node === 'number') {
+    return String(node)
+  }
 
-      return 'notice-id'
-    },
-    notifyError: (error, fallback) => {
-      notifications.push({ error, fallback })
+  if (Array.isArray(node)) {
+    return node.map(textContent).join('')
+  }
 
-      return fallback
-    },
-    onEvent: (type, listener) => {
-      const set = listeners.get(type) ?? new Set()
+  return textContent(node.props?.children)
+}
 
-      set.add(listener)
-      listeners.set(type, set)
+export function findAll(node, predicate, matches = []) {
+  if (node == null || node === false) {
+    return matches
+  }
 
-      return () => set.delete(listener)
-    },
-    state: {
-      focusedSessionId: {
-        get: () => (typeof sessionId === 'function' ? sessionId() : sessionId)
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      findAll(child, predicate, matches)
+    }
+
+    return matches
+  }
+
+  if (typeof node === 'object') {
+    if (predicate(node)) {
+      matches.push(node)
+    }
+
+    findAll(node.props?.children, predicate, matches)
+  }
+
+  return matches
+}
+
+export function findButton(node, label) {
+  const button = findAll(node, item => item.type === 'button' && textContent(item) === label)[0]
+
+  assert.ok(button, `button ${JSON.stringify(label)} is present`)
+
+  return button
+}
+
+function jsx(type, props = {}, key) {
+  return { key, props, type }
+}
+
+function component(tag, extra = {}) {
+  return props => jsx(tag, { ...extra, ...props })
+}
+
+function createSdk() {
+  return {
+    Button: component('button'),
+    EmptyState: props => jsx('empty-state', props),
+    ErrorState: props => jsx('error-state', props),
+    Loader: component('loader', { role: 'progressbar' }),
+    ROUTES_AREA: 'routes',
+    SIDEBAR_NAV_AREA: 'sidebar.nav',
+    StatusDot: props => jsx('status-dot', props),
+    Textarea: component('textarea'),
+    cn: (...classes) => classes.flat().filter(Boolean).join(' ')
+  }
+}
+
+function createRenderer(rootElement, hooks) {
+  const root = {
+    effects: [],
+    hookIndex: 0,
+    hooks: [],
+    render: null,
+    rootElement,
+    tree: null
+  }
+  let active = null
+
+  const sameDeps = (left, right) =>
+    Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((value, index) => Object.is(value, right[index]))
+
+  const useState = initial => {
+    const index = active.hookIndex++
+    const record = active.hooks[index] ?? { value: typeof initial === 'function' ? initial() : initial }
+
+    active.hooks[index] = record
+    return [record.value, next => {
+      const value = typeof next === 'function' ? next(record.value) : next
+
+      if (!Object.is(value, record.value)) {
+        record.value = value
+        root.render()
       }
+    }]
+  }
+
+  const useRef = initial => {
+    const index = active.hookIndex++
+    const record = active.hooks[index] ?? { current: initial }
+
+    active.hooks[index] = record
+    return record
+  }
+
+  const useMemo = (factory, deps) => {
+    const index = active.hookIndex++
+    const record = active.hooks[index]
+
+    if (!record || !sameDeps(record.deps, deps)) {
+      const next = { deps, value: factory() }
+
+      active.hooks[index] = next
+      return next.value
+    }
+
+    return record.value
+  }
+
+  const useCallback = (callback, deps) => useMemo(() => callback, deps)
+
+  const useEffect = (effect, deps) => {
+    const index = active.hookIndex++
+    const record = active.hooks[index] ?? { cleanup: undefined, deps: undefined }
+
+    active.hooks[index] = record
+    if (!sameDeps(record.deps, deps)) {
+      record.deps = deps
+      root.effects.push({ effect, record })
     }
   }
 
-  const nonce = `relay-${seq++}`
+  const resolve = element => {
+    if (element == null || element === false || typeof element === 'string' || typeof element === 'number') {
+      return element
+    }
 
-  globalThis.__RELAY_SDK__ = globalThis.__RELAY_SDK__ ?? {}
-  globalThis.__RELAY_SDK__[nonce] = {
-    COMPOSER_AREAS: { atCompletions: 'composer.atCompletions', middleware: 'composer.middleware' },
-    host: stubHost
+    if (Array.isArray(element)) {
+      return element.map(resolve)
+    }
+
+    if (typeof element.type === 'function') {
+      return resolve(element.type(element.props || {}))
+    }
+
+    return { ...element, props: { ...element.props, children: resolve(element.props?.children) } }
   }
 
-  assert.match(SOURCE, SDK_IMPORT, 'plugin.js imports the SDK on one line')
+  root.render = () => {
+    active = root
+    root.hookIndex = 0
+    const output = root.rootElement.type(root.rootElement.props || {})
 
-  const code = SOURCE.replace(
-    SDK_IMPORT,
-    `const { COMPOSER_AREAS, host } = globalThis.__RELAY_SDK__[${JSON.stringify(nonce)}]\n`
-  )
+    active = null
+    root.tree = resolve(output)
+  }
+
+  const runEffects = () => {
+    while (root.effects.length) {
+      const { effect, record } = root.effects.shift()
+
+      record.cleanup?.()
+      record.cleanup = effect() || undefined
+    }
+  }
+
+  return {
+    dispose: () => {
+      for (const record of root.hooks) {
+        record?.cleanup?.()
+      }
+    },
+    flushEffects: runEffects,
+    get tree() {
+      return root.tree
+    },
+    hooks: { useCallback, useEffect, useMemo, useRef, useState },
+    render: root.render
+  }
+}
+
+/**
+ * Load desktop/plugin.js as a fresh uncompiled ESM module, then expose the page
+ * against a scoped REST/socket/storage stub. `rest` receives every request after
+ * it has been recorded and can return or throw an endpoint-specific result.
+ */
+export async function loadRelay({
+  channels = [{ id: 'general', name: 'General', summary: 'The main Relay channel' }],
+  histories = { general: { messages: [] } },
+  post,
+  rest,
+  status = { status: 'ready' },
+  storedSelection = ''
+} = {}) {
+  const calls = []
+  const registrations = []
+  const socketHandlers = []
+  const storage = { get: [], set: [] }
+  const timers = new Map()
+  let timerId = 0
+  const nonce = `relay-${sequence++}`
+
+  const setIntervalStub = (callback, delay) => {
+    const id = ++timerId
+
+    timers.set(id, { callback, delay })
+    return id
+  }
+  const clearIntervalStub = id => timers.delete(id)
+
+  const renderer = createRenderer
+  globalThis.__RELAY_DESKTOP_TEST__ = globalThis.__RELAY_DESKTOP_TEST__ ?? {}
+  globalThis.__RELAY_DESKTOP_TEST__[nonce] = { sdk: createSdk(), timers: { clearIntervalStub, setIntervalStub } }
+
+  assert.match(SOURCE, SDK_IMPORT, 'plugin imports the SDK directly')
+  assert.match(SOURCE, REACT_IMPORT, 'plugin imports React hooks directly')
+  assert.match(SOURCE, JSX_IMPORT, 'plugin imports the JSX runtime directly')
+
+  const prelude = `const __relay = globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}]\n`
+  let code = SOURCE
+    .replace(SDK_IMPORT, `${prelude}const { Button, EmptyState, ErrorState, Loader, ROUTES_AREA, SIDEBAR_NAV_AREA, StatusDot, Textarea, cn } = __relay.sdk\n`)
+    .replace(REACT_IMPORT, `const { useCallback, useEffect, useRef, useState } = globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}].hooks\n`)
+    .replace(JSX_IMPORT, `const { jsx, jsxs } = globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}].jsxRuntime\n`)
+    .replace(/\bsetInterval\(/g, `globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}].timers.setIntervalStub(`)
+    .replace(/\bclearInterval\(/g, `globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}].timers.clearIntervalStub(`)
+
+  // Hooks must be attached after the page element exists; the loader shim reads
+  // the same object at module evaluation time, so a tiny lazy proxy supplies it.
+  const hookProxy = {}
+  for (const name of ['useCallback', 'useEffect', 'useRef', 'useState']) {
+    hookProxy[name] = (...args) => hookProxy.renderer.hooks[name](...args)
+  }
+  globalThis.__RELAY_DESKTOP_TEST__[nonce].hooks = hookProxy
+  globalThis.__RELAY_DESKTOP_TEST__[nonce].jsxRuntime = { jsx, jsxs: jsx }
+
   const module = await import(`data:text/javascript;base64,${Buffer.from(code, 'utf8').toString('base64')}`)
   const plugin = module.default
 
   const ctx = {
-    onDispose: () => undefined,
-    register: contribution => {
-      registrations.push(contribution)
-
+    registerMany: contributions => {
+      registrations.push(...contributions)
       return () => undefined
     },
     rest: async (path, options = {}) => {
       calls.push({ options, path })
-
       if (rest) {
-        return rest(path, options)
+        return rest(path, options, calls)
       }
 
-      if (path === '/participants') {
-        return { participants }
+      if (path === '/connection/status') {
+        return typeof status === 'function' ? status() : status
+      }
+      if (path === '/connection/authorize') {
+        return { ok: true }
+      }
+      if (path === '/channels') {
+        return { channels }
+      }
+      if (path.startsWith('/channels/') && path.endsWith('/messages?limit=50')) {
+        const id = decodeURIComponent(path.slice('/channels/'.length, path.indexOf('/messages?')))
+
+        return typeof histories[id] === 'function' ? histories[id]() : histories[id] ?? { messages: [] }
+      }
+      if (path.startsWith('/channels/') && path.endsWith('/messages') && options.method === 'POST') {
+        return post ? post(options.body, path, calls) : { ok: true }
       }
 
-      if (path === '/dispatch') {
-        return dispatch
-          ? dispatch(options.body)
-          : { ok: true, turns: [{ participant_id: 'claude:default', participant_turn_id: 'pturn-1' }] }
+      throw new Error(`unexpected scoped REST path ${path}`)
+    },
+    socket: (path, onMessage) => {
+      socketHandlers.push({ onMessage, path })
+      return () => {
+        const index = socketHandlers.findIndex(item => item.onMessage === onMessage)
+        if (index !== -1) {
+          socketHandlers.splice(index, 1)
+        }
       }
-
-      throw new Error(`unexpected REST path ${path}`)
+    },
+    storage: {
+      get: key => {
+        storage.get.push(key)
+        return key === 'relay.selection.channelId' ? storedSelection : undefined
+      },
+      set: (key, value) => storage.set.push({ key, value })
     }
   }
 
   plugin.register(ctx)
-  await flush()
 
-  const find = area => registrations.find(contribution => contribution.area === area)
+  const route = registrations.find(item => item.area === 'routes')
+  const mount = () => {
+    assert.ok(route?.render, 'route has a page renderer')
+    const page = route.render()
+    const app = renderer(page, null)
+
+    hookProxy.renderer = app
+    // The first render runs before the hooks proxy knows its renderer. Re-render
+    // once after wiring it so every hook resolves through the active renderer.
+    app.render()
+
+    return {
+      dispose: app.dispose,
+      flushEffects: app.flushEffects,
+      get tree() {
+        return app.tree
+      },
+      async settle(turns = 8) {
+        for (let index = 0; index < turns; index += 1) {
+          app.flushEffects()
+          await flush()
+        }
+      }
+    }
+  }
 
   return {
     calls,
-    /** Every `POST /dispatch` recorded so far. */
-    dispatches: () => calls.filter(call => call.path === '/dispatch'),
-    /** Push a gateway event at whatever the plugin subscribed with. */
-    emit: (type, event) => {
-      for (const listener of listeners.get(type) ?? []) {
-        listener(event)
+    channels: () => calls.filter(call => call.path === '/channels'),
+    dispatchSocket: payload => {
+      for (const entry of [...socketHandlers]) {
+        entry.onMessage(payload)
       }
     },
-    find,
-    handler: find('composer.middleware')?.data.handler,
-    listeners,
-    notices,
-    notifications,
+    histories: () => calls.filter(call => call.path.includes('/messages?limit=50')),
+    mount,
     plugin,
-    registrations
+    posts: () => calls.filter(call => call.options.method === 'POST' && call.path.includes('/messages')),
+    registrations,
+    socketHandlers,
+    storage,
+    tickPoll: () => {
+      for (const timer of [...timers.values()]) {
+        timer.callback()
+      }
+    },
+    timers
   }
 }

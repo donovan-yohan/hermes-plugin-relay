@@ -1,149 +1,100 @@
-/**
- * Desktop half — `composer.atCompletions` source (participant seam contract §9).
- *
- * See _harness.mjs for how the plugin is loaded (uncompiled ESM, stubbed SDK,
- * a fresh module instance per test).
- */
-
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-import { loadPlugin as load } from './_harness.mjs'
+import { findAll, loadRelay } from './_harness.mjs'
 
-const ROSTER = [
-  {
-    adapter_id: 'claude-code-stream-json',
-    capabilities: { streaming: true, text: true },
-    display_name: 'Claude Code',
-    handle: 'claude',
-    id: 'claude:default',
-    status: 'ready'
-  },
-  {
-    adapter_id: 'codex-app-server',
-    capabilities: { streaming: true, text: true },
-    display_name: 'Codex',
-    handle: 'codex',
-    id: 'codex:default',
-    status: 'ready'
-  },
-  {
-    adapter_id: 'mock',
-    capabilities: { streaming: true, text: true },
-    display_name: 'Mock Agent',
-    handle: 'mock',
-    id: 'mock:default',
-    status: 'offline'
-  }
-]
+const SOURCE = readFileSync(new URL('../../desktop/plugin.js', import.meta.url), 'utf8')
 
-/** Every test here starts from the same three-participant roster. */
-const loadPlugin = options => load({ participants: ROSTER, ...options })
+function sourceImports(source) {
+  return [...source.matchAll(/from '([^']+)'/g)].map(match => match[1])
+}
 
-test('register contributes an atCompletions source and a middleware handler', async () => {
-  const { find, plugin, registrations } = await loadPlugin()
+function callForm(app) {
+  const form = findAll(app.tree, node => node.type === 'form')[0]
 
-  assert.strictEqual(plugin.id, 'hermes-plugin-relay')
-  assert.strictEqual(plugin.name, 'Relay Participants')
-  assert.strictEqual(plugin.defaultEnabled, false, 'desktop half ships opt-in')
+  assert.ok(form, 'Relay composer form is rendered')
+  return form
+}
 
-  const completions = find('composer.atCompletions')
-  const middleware = find('composer.middleware')
-
-  assert.ok(completions, 'atCompletions contribution registered')
-  assert.strictEqual(completions.id, 'participant-completions')
-  assert.strictEqual(typeof completions.data.provide, 'function')
-
-  assert.ok(middleware, 'middleware contribution registered')
-  assert.strictEqual(middleware.id, 'participant-router')
-  assert.strictEqual(typeof middleware.data.handler, 'function')
-
-  assert.strictEqual(registrations.length, 2, 'no other surfaces are claimed')
+test('is an uncompiled route-only plugin with only the permitted imports', () => {
+  assert.deepStrictEqual(sourceImports(SOURCE), ['@hermes/plugin-sdk', 'react', 'react/jsx-runtime'])
+  assert.match(SOURCE, /ROUTES_AREA/)
+  assert.match(SOURCE, /SIDEBAR_NAV_AREA/)
+  assert.doesNotMatch(SOURCE, /COMPOSER_AREAS|composer\.middleware|atCompletions|participant/i)
+  assert.doesNotMatch(SOURCE, /host\.(?:request|openSession|newChat)|session[_./]|provider|claude|codex/i)
+  assert.doesNotMatch(SOURCE, /\bfetch\(|XMLHttpRequest|https?:\/\/|<iframe|iframe/i)
+  assert.doesNotMatch(SOURCE, /storage\.(?:set|get)\([^)]*(?:token|credential|secret|auth)/i)
+  assert.match(SOURCE, /relay\.selection\.channelId/)
+  assert.doesNotMatch(SOURCE, /ctx\.storage\.(?:set|get)\([^)]*(?!relay\.selection\.channelId)/)
 })
 
-test('the roster is fetched once at register through the plugin namespace', async () => {
-  const { calls } = await loadPlugin()
+test('registers exactly one full /relay route and one sidebar entry', async () => {
+  const relay = await loadRelay()
 
-  assert.deepStrictEqual(
-    calls.map(call => call.path),
-    ['/participants']
-  )
-  assert.strictEqual(calls[0].options.method, undefined, 'roster read is a GET')
-})
-
-test('provide() filters the cached roster by handle prefix', async () => {
-  const { find } = await loadPlugin()
-  const { provide } = find('composer.atCompletions').data
-
-  assert.deepStrictEqual(provide('cl'), [
-    { display: '@claude', insert: '@claude', meta: 'External · Claude Code' }
-  ])
-  assert.deepStrictEqual(
-    provide('c').map(item => item.insert),
-    ['@claude', '@codex']
-  )
-  assert.deepStrictEqual(provide('zzz'), [])
-})
-
-test('provide() offers the whole roster for an empty query, status included', async () => {
-  const { find } = await loadPlugin()
-  const { provide } = find('composer.atCompletions').data
-
-  assert.deepStrictEqual(provide(''), [
-    { display: '@claude', insert: '@claude', meta: 'External · Claude Code' },
-    { display: '@codex', insert: '@codex', meta: 'External · Codex' },
-    { display: '@mock', insert: '@mock', meta: 'External · Mock Agent · offline' }
+  assert.strictEqual(relay.plugin.id, 'hermes-plugin-relay')
+  assert.strictEqual(relay.plugin.name, 'Relay')
+  assert.strictEqual(relay.plugin.defaultEnabled, false)
+  assert.strictEqual(relay.registrations.length, 2)
+  assert.deepStrictEqual(relay.registrations, [
+    {
+      area: 'routes',
+      data: { path: '/relay' },
+      id: 'page',
+      render: relay.registrations[0].render
+    },
+    {
+      area: 'sidebar.nav',
+      data: { codicon: 'comment-discussion', label: 'Relay', path: '/relay' },
+      id: 'nav',
+      order: 55
+    }
   ])
 })
 
-test('provide() tolerates a typed "@" prefix and odd input without throwing', async () => {
-  const { find } = await loadPlugin()
-  const { provide } = find('composer.atCompletions').data
-
-  assert.deepStrictEqual(
-    provide('@CO').map(item => item.insert),
-    ['@codex']
-  )
-  assert.deepStrictEqual(provide(undefined).length, 3)
-  assert.deepStrictEqual(provide(null).length, 3)
-})
-
-test('a failing roster fetch yields no rows instead of throwing', async () => {
-  const { find } = await loadPlugin({
-    rest: async () => {
-      throw new Error('backend disabled')
+test('lists once, selects one channel, loads its 50-message window, and posts once', async () => {
+  const relay = await loadRelay({
+    channels: [
+      { id: 'general', name: 'General' },
+      { id: 'ops', name: 'Operations' }
+    ],
+    histories: {
+      general: { messages: [] },
+      ops: { messages: [{ author: { type: 'human' }, id: 'ops-1', text: 'hello' }] }
     }
   })
-  const { provide } = find('composer.atCompletions').data
+  const app = relay.mount()
 
-  assert.deepStrictEqual(provide('cl'), [], 'no roster, no rows')
-  assert.deepStrictEqual(provide(''), [])
-})
+  await app.settle()
+  assert.strictEqual(relay.channels().length, 1, 'the channel list is requested exactly once on page load')
+  assert.strictEqual(relay.histories().filter(call => call.path.includes('/channels/general/')).length, 1)
 
-test('a malformed roster row is dropped, and a participant may not claim @hermes', async () => {
-  const { find } = await loadPlugin({
-    rest: async () => ({
-      participants: [
-        ROSTER[0],
-        { display_name: 'Impostor', handle: 'hermes', id: 'x' },
-        { display_name: 'No handle', id: 'y' },
-        null,
-        { display_name: 'Dupe', handle: 'CLAUDE', id: 'claude:other' }
-      ]
-    })
+  const ops = findAll(app.tree, node => node.type === 'button' && node.props?.['data-channel-id'] === 'ops')[0]
+  assert.ok(ops, 'Operations is selectable')
+  ops.props.onClick()
+  await app.settle()
+
+  assert.strictEqual(relay.histories().filter(call => call.path.includes('/channels/ops/')).length, 1, 'selection loads one history window')
+  const textarea = findAll(app.tree, node => node.type === 'textarea')[0]
+
+  assert.ok(textarea, 'the composer is rendered')
+  textarea.props.onChange({ target: { value: 'ship it' } })
+  callForm(app).props.onSubmit({ preventDefault() {} })
+  await app.settle()
+
+  assert.strictEqual(relay.posts().length, 1, 'one submit emits exactly one POST')
+  assert.deepStrictEqual(relay.posts()[0], {
+    options: {
+      body: {
+        clientMessageId: relay.posts()[0].options.body.clientMessageId,
+        format: 'markdown',
+        text: 'ship it'
+      },
+      method: 'POST'
+    },
+    path: '/channels/ops/messages'
   })
-  const { provide } = find('composer.atCompletions').data
-
-  assert.deepStrictEqual(
-    provide('').map(item => item.insert),
-    ['@claude'],
-    'hermes, handle-less, null and duplicate rows are rejected'
-  )
-})
-
-test('a roster fetch that never resolves cannot block the popover', async () => {
-  const { find } = await loadPlugin({ rest: () => new Promise(() => undefined) })
-  const { provide } = find('composer.atCompletions').data
-
-  assert.deepStrictEqual(provide('cl'), [], 'provide stays synchronous')
+  assert.ok(relay.posts()[0].options.body.clientMessageId, 'the client provides its own idempotency key')
+  assert.strictEqual(relay.storage.set.at(-1)?.value, 'ops', 'only the non-secret selected channel is persisted')
+  assert.strictEqual(relay.histories().filter(call => call.path.includes('/channels/ops/')).length, 2, 'a confirmed post immediately refreshes the latest window')
 })

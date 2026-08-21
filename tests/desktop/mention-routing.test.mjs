@@ -1,493 +1,210 @@
-/**
- * Desktop half — `composer.middleware` routing (participant seam contract §9).
- *
- * See _harness.mjs for how the plugin is loaded (uncompiled ESM, stubbed SDK,
- * a fresh module instance per test).
- *
- * The gates asserted here are the ones that keep the seam honest:
- *   - a draft addressed only to participants is consumed ({handled:true});
- *   - a draft that also addresses @hermes dispatches AND passes through;
- *   - a draft with no known handle never reaches the backend;
- *   - one submit dispatches at most once, even re-entered concurrently;
- *   - participant activity on the gateway event stream cannot dispatch;
- *   - only a pre-acceptance refusal passes through; a committed result is
- *     consumed and an ambiguous one cancels — never lost, never sent twice.
- */
-
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { flush, loadPlugin as load } from './_harness.mjs'
+import { findAll, findButton, loadRelay, textContent } from './_harness.mjs'
 
-const ROSTER = [
-  {
-    adapter_id: 'claude-code-stream-json',
-    capabilities: { streaming: true, text: true },
-    display_name: 'Claude Code',
-    handle: 'claude',
-    id: 'claude:default',
-    status: 'ready'
-  },
-  {
-    adapter_id: 'codex-app-server',
-    capabilities: { streaming: true, text: true },
-    display_name: 'Codex',
-    handle: 'codex',
-    id: 'codex:default',
-    status: 'ready'
-  }
-]
+function responseError(status, message) {
+  const error = new Error(`${status}: ${message}`)
 
-/** Every test here routes against the same two-participant roster. */
-const loadPlugin = options => load({ participants: ROSTER, ...options })
+  error.statusCode = status
+  return error
+}
 
-// ── targeting ────────────────────────────────────────────────────────────────
+function textarea(app) {
+  const control = findAll(app.tree, node => node.type === 'textarea')[0]
 
-test('a participant-only draft dispatches with append_user_message and is consumed', async () => {
-  const { dispatches, handler } = await loadPlugin()
-  const draft = { text: '@claude review this' }
-  const result = await handler(draft)
+  assert.ok(control, 'Relay composer is available')
+  return control
+}
 
-  assert.strictEqual(dispatches().length, 1)
-
-  const { dispatch_id: dispatchId, ...body } = dispatches()[0].options.body
-
-  assert.deepStrictEqual(body, {
-    append_user_message: true,
-    mentions: ['claude'],
-    session_id: 'sess-1',
-    text: '@claude review this'
-  })
-  assert.ok(typeof dispatchId === 'string' && dispatchId.length >= 8, `dispatch_id present: ${dispatchId}`)
-  assert.strictEqual(dispatches()[0].options.method, 'POST')
-  assert.deepStrictEqual(result, { handled: true }, 'draft consumed — no Hermes turn')
-})
-
-test('two participants in one draft ride a single dispatch', async () => {
-  const { dispatches, handler } = await loadPlugin()
-  const result = await handler({ text: '@claude and @codex go' })
-
-  assert.strictEqual(dispatches().length, 1, 'one submit, one dispatch')
-  assert.deepStrictEqual(dispatches()[0].options.body.mentions, ['claude', 'codex'])
-  assert.strictEqual(dispatches()[0].options.body.append_user_message, true)
-  assert.deepStrictEqual(result, { handled: true })
-})
-
-test('mentioning @hermes alongside a participant dispatches AND passes the draft through', async () => {
-  const { dispatches, handler } = await loadPlugin()
-  const draft = { text: '@claude plus @hermes' }
-  const result = await handler(draft)
-
-  assert.strictEqual(dispatches().length, 1)
-
-  const { dispatch_id: dispatchId, ...body } = dispatches()[0].options.body
-
-  assert.deepStrictEqual(body, {
-    append_user_message: false,
-    mentions: ['claude'],
-    session_id: 'sess-1',
-    text: '@claude plus @hermes'
-  })
-  assert.ok(typeof dispatchId === 'string' && dispatchId.length >= 8)
-  assert.strictEqual(result, draft, 'Hermes turn proceeds normally and persists the human row')
-})
-
-test('a draft with no known mention never reaches the backend', async () => {
-  const { calls, dispatches, handler } = await loadPlugin()
-
-  for (const text of [
-    'hello no mentions',
-    '@nobody are you there',
-    'mail me at user@codex.com',
-    'ask @hermes about it',
-    '```\n@claude ignored inside a fence\n```',
-    'inline `@claude` is quoted, not addressed'
-  ]) {
-    const draft = { text }
-
-    assert.strictEqual(await handler(draft), draft, `passthrough: ${text}`)
-  }
-
-  assert.strictEqual(dispatches().length, 0, 'no dispatch without a known external handle')
-  assert.deepStrictEqual(
-    calls.map(call => call.path),
-    ['/participants'],
-    'the roster read is the only REST traffic'
-  )
-})
-
-test('mentions are matched case-insensitively and anywhere in the text', async () => {
-  const { dispatches, handler } = await loadPlugin()
-
-  await handler({ text: 'please have (@Claude) take a look, cc @CODEX' })
-
-  assert.deepStrictEqual(dispatches()[0].options.body.mentions, ['claude', 'codex'])
-})
-
-test('a draft with no live session passes through instead of dispatching', async () => {
-  const { dispatches, handler } = await loadPlugin({ sessionId: null })
-  const draft = { text: '@claude review this' }
-
-  assert.strictEqual(await handler(draft), draft)
-  assert.strictEqual(dispatches().length, 0)
-})
-
-test('the session id is read at dispatch time, never cached from register', async () => {
-  let current = 'sess-a'
-  const { dispatches, handler } = await loadPlugin({ sessionId: () => current })
-
-  await handler({ text: '@claude first' })
-  current = 'sess-b'
-  await handler({ text: '@claude second' })
-
-  assert.deepStrictEqual(
-    dispatches().map(call => call.options.body.session_id),
-    ['sess-a', 'sess-b']
-  )
-})
-
-// ── idempotence ──────────────────────────────────────────────────────────────
-
-test('concurrent handler calls for the same draft dispatch exactly once', async () => {
-  let release
-  const gate = new Promise(resolve => {
-    release = resolve
-  })
-  const { dispatches, handler } = await loadPlugin({
-    dispatch: async () => {
-      await gate
-
-      return { ok: true, turns: [] }
-    }
-  })
-  const draft = { text: '@claude review this' }
-  const both = Promise.all([handler(draft), handler(draft)])
-
-  await flush()
-  assert.strictEqual(dispatches().length, 1, 'second entry joined the in-flight dispatch')
-
-  release()
-
-  const [first, second] = await both
-
-  assert.deepStrictEqual(first, { handled: true })
-  assert.deepStrictEqual(second, { handled: true })
-  assert.strictEqual(dispatches().length, 1)
-  assert.ok(dispatches()[0].options.body.dispatch_id, 'the single POST carries one dispatch_id')
-})
-
-test('the pass-through (@hermes) path also dispatches only once when re-entered', async () => {
-  const { dispatches, handler } = await loadPlugin()
-  const draft = { text: '@claude plus @hermes' }
-  const [first, second] = await Promise.all([handler(draft), handler(draft)])
-
-  assert.strictEqual(dispatches().length, 1)
-  assert.strictEqual(first, draft)
-  assert.strictEqual(second, draft)
-})
-
-// The guard keys on the draft OBJECT, not its text: the composer builds a
-// fresh draft per submit, so identical text from a deliberate re-send is a new
-// attempt and must reach the backend.
-test('a deliberate re-send of identical text dispatches again, with a fresh dispatch_id', async () => {
-  const { dispatches, handler } = await loadPlugin()
-
-  await handler({ text: '@claude review this' })
-  await handler({ text: '@claude review this' })
-
-  assert.strictEqual(dispatches().length, 2, 'a deliberate re-send is not swallowed')
-  assert.notStrictEqual(
-    dispatches()[0].options.body.dispatch_id,
-    dispatches()[1].options.body.dispatch_id,
-    'a new attempt is a new dispatch_id — the server must not dedupe it away'
-  )
-})
-
-test('an identical re-send while the first is still in flight is still a separate attempt', async () => {
-  let release
-  const gate = new Promise(resolve => {
-    release = resolve
-  })
-  const { dispatches, handler } = await loadPlugin({
-    dispatch: async () => {
-      await gate
-
-      return { ok: true, turns: [] }
-    }
-  })
-
-  // Two distinct draft objects: two submits that happen to overlap.
-  const both = Promise.all([handler({ text: '@claude review this' }), handler({ text: '@claude review this' })])
-
-  await flush()
-  assert.strictEqual(dispatches().length, 2, 'text equality must not collapse two real submits')
-
-  release()
-  await both
-
-  assert.strictEqual(new Set(dispatches().map(call => call.options.body.dispatch_id)).size, 2)
-})
-
-test('the same draft object never dispatches twice, even after the first settled', async () => {
-  const { dispatches, handler } = await loadPlugin()
-  const draft = { text: '@claude review this' }
-
-  const first = await handler(draft)
-
-  assert.deepStrictEqual(first, { handled: true })
-  assert.strictEqual(dispatches().length, 1)
-
-  const second = await handler(draft)
-
-  assert.deepStrictEqual(second, { handled: true }, 'memoized outcome, not a second send')
-  assert.strictEqual(dispatches().length, 1, 'one draft attempt, one dispatch — ever')
-})
-
-// ── recursion suppression ────────────────────────────────────────────────────
-
-test('participant activity on the gateway event stream can never dispatch', async () => {
-  const { dispatches, emit, handler, listeners } = await loadPlugin()
-
-  await handler({ text: '@claude review this' })
-  assert.strictEqual(dispatches().length, 1)
-
-  assert.ok(listeners.has('participant.message.complete'), 'plugin taps participant events')
-
-  emit('participant.message.start', {
-    params: { payload: { participant_turn_id: 'pturn-1', row_id: 7 }, session_id: 'sess-1' },
-    type: 'participant.message.start'
-  })
-  emit('participant.message.complete', {
-    params: {
-      payload: {
-        participant_turn_id: 'pturn-1',
-        row_id: 7,
-        status: 'completed',
-        text: '@claude @codex @hermes — reply text that names everyone'
-      },
-      session_id: 'sess-1'
-    },
-    type: 'participant.message.complete'
-  })
-  await flush()
-
-  assert.strictEqual(dispatches().length, 1, 'participant output never re-enters the router')
-})
-
-// ── failure fallback ─────────────────────────────────────────────────────────
-
-test('an ambiguous failure retries once with the SAME dispatch_id, then cancels the send', async () => {
-  const { dispatches, handler, notifications } = await loadPlugin({
-    dispatch: async () => {
-      throw new Error('socket hang up')
-    }
-  })
-  const draft = { text: '@claude review this' }
-  const result = await handler(draft)
-
-  assert.strictEqual(dispatches().length, 2, 'exactly one retry')
-  assert.strictEqual(
-    dispatches()[0].options.body.dispatch_id,
-    dispatches()[1].options.body.dispatch_id,
-    'a retry NEVER mints a fresh dispatch_id — the server dedupes on it'
-  )
-  assert.strictEqual(result, null, 'composer restores the draft; Hermes is not woken')
-  assert.strictEqual(notifications.length, 1, 'exactly one error surfaced')
-  assert.match(notifications[0].fallback, /@claude/)
-  assert.match(notifications[0].fallback, /restored/)
-})
-
-test('a 5xx is ambiguous too — retried, then cancelled', async () => {
-  const { dispatches, handler } = await loadPlugin({
-    dispatch: async () => {
-      const error = new Error('503: upstream unavailable')
-
-      error.statusCode = 503
-      throw error
-    }
-  })
-
-  assert.strictEqual(await handler({ text: '@claude review this' }), null)
-  assert.strictEqual(dispatches().length, 2)
-})
-
-test('an ambiguous first attempt that succeeds on retry is accepted', async () => {
-  let attempts = 0
-  const { dispatches, handler } = await loadPlugin({
-    dispatch: async () => {
-      attempts += 1
-
-      if (attempts === 1) {
-        throw new Error('ETIMEDOUT')
+test('renders safe human, agent, and system attribution without parsing message text', async () => {
+  const relay = await loadRelay({
+    histories: {
+      general: {
+        messages: [
+          { author: { displayName: 'Ari', type: 'human' }, id: 'human-1', text: '@agent is ordinary message content' },
+          { author_type: 'agent', id: 'agent-1', text: 'Automated reply' },
+          { id: 'system-1', role: 'system', text: 'Channel opened' }
+        ]
       }
-
-      return { ok: true, turns: [] }
     }
   })
+  const app = relay.mount()
 
-  assert.deepStrictEqual(await handler({ text: '@claude review this' }), { handled: true })
-  assert.strictEqual(dispatches().length, 2)
-  assert.strictEqual(dispatches()[0].options.body.dispatch_id, dispatches()[1].options.body.dispatch_id)
-})
-
-test('an explicit 4xx passes the draft through — nothing was dispatched', async () => {
-  const { dispatches, handler, notifications } = await loadPlugin({
-    dispatch: async () => {
-      const error = new Error('400: {"ok":false,"error":"missing dispatch_id"}')
-
-      error.statusCode = 400
-      throw error
-    }
-  })
-  const draft = { text: '@claude review this' }
-
-  assert.strictEqual(await handler(draft), draft, 'the message still reaches Hermes')
-  assert.strictEqual(dispatches().length, 1, 'a stated rejection is never retried')
-  assert.ok(notifications.length <= 1, 'at most one notice')
-})
-
-test('a 4xx is classified from the message when the status property is stripped by IPC', async () => {
-  const { dispatches, handler } = await loadPlugin({
-    dispatch: async () => {
-      // What ipcRenderer.invoke surfaces: custom props gone, message intact.
-      throw new Error(`Error invoking remote method 'hermes:api': Error: 404: {"detail":"no such session"}`)
-    }
-  })
-  const draft = { text: '@claude review this' }
-
-  assert.strictEqual(await handler(draft), draft)
-  assert.strictEqual(dispatches().length, 1, 'recognized as definite, so not retried')
-})
-
-test('a 200 {ok:false} with NO side-effect markers is pre-acceptance: pass through, no retry', async () => {
-  const { dispatches, handler, notifications } = await loadPlugin({
-    dispatch: async () => ({ error: 'unknown session', ok: false })
-  })
-  const draft = { text: '@claude review this' }
-
-  assert.strictEqual(await handler(draft), draft)
-  assert.strictEqual(dispatches().length, 1)
-  assert.strictEqual(notifications.length, 1)
-  assert.match(notifications[0].fallback, /Hermes instead/)
-})
-
-// Contract v1.5: a 200 ok:false is a COMMITTED result whenever it carries
-// side-effect markers. Passing that draft through would append the user row a
-// second time and wake Hermes, who was never addressed.
-test('a committed partial failure consumes the draft and reports which participants failed', async () => {
-  const { dispatches, handler, notices, notifications } = await loadPlugin({
-    dispatch: async () => ({
-      error: 'codex failed to start',
-      failed: [{ error: 'binary not found', participant_id: 'codex:default' }],
-      ok: false,
-      turns: [{ participant_id: 'claude:default', participant_turn_id: 'pturn-1' }],
-      user_row_appended: true
-    })
-  })
-  const draft = { text: '@claude and @codex go' }
-  const result = await handler(draft)
-
-  assert.deepStrictEqual(result, { handled: true }, 'consumed — the user row already exists')
-  assert.notStrictEqual(result, draft, 'must NOT pass through to Hermes')
-  assert.strictEqual(dispatches().length, 1, 'a committed result is never retried')
-  assert.strictEqual(notifications.length, 0, 'not an error — the send happened')
-  assert.strictEqual(notices.length, 1, 'exactly one notice')
-  assert.match(notices[0].message, /codex/, 'names the participant that failed')
-})
-
-test('either side-effect marker alone marks the result committed', async () => {
-  const rowOnly = await loadPlugin({
-    dispatch: async () => ({ error: 'all participants failed', ok: false, turns: [], user_row_appended: true })
-  })
-
-  assert.deepStrictEqual(await rowOnly.handler({ text: '@claude go' }), { handled: true })
-
-  const turnsOnly = await loadPlugin({
-    dispatch: async () => ({
-      error: 'user row failed',
-      ok: false,
-      turns: [{ participant_id: 'claude:default', participant_turn_id: 'pturn-1' }]
-    })
-  })
-
-  assert.deepStrictEqual(await turnsOnly.handler({ text: '@claude go' }), { handled: true })
-})
-
-test('a committed partial on the @hermes path passes through without a duplicate dispatch', async () => {
-  const { dispatches, handler, notices } = await loadPlugin({
-    dispatch: async () => ({
-      failed: [{ error: 'binary not found', participant_id: 'codex:default' }],
-      ok: false,
-      turns: [{ participant_id: 'claude:default', participant_turn_id: 'pturn-1' }],
-      user_row_appended: false
-    })
-  })
-  const draft = { text: '@claude and @codex plus @hermes' }
-
-  assert.strictEqual(await handler(draft), draft, 'Hermes was addressed, so its turn still runs')
-  assert.strictEqual(dispatches().length, 1)
-  assert.strictEqual(notices.length, 1)
-  assert.match(notices[0].message, /codex:default/)
-})
-
-test('on the @hermes path a 4xx passes through but an ambiguous failure cancels', async () => {
-  const rejected = await loadPlugin({
-    dispatch: async () => {
-      const error = new Error('422: unknown participant')
-
-      error.statusCode = 422
-      throw error
-    }
-  })
-  const rejectedDraft = { text: '@claude plus @hermes' }
-
-  assert.strictEqual(await rejected.handler(rejectedDraft), rejectedDraft, 'Hermes turn still runs')
-
-  const ambiguous = await loadPlugin({
-    dispatch: async () => {
-      throw new Error('socket hang up')
-    }
-  })
-
-  assert.strictEqual(
-    await ambiguous.handler({ text: '@claude plus @hermes' }),
-    null,
-    'waking Hermes here could pair with a participant send that actually landed'
+  await app.settle()
+  assert.deepStrictEqual(
+    findAll(app.tree, node => node.type === 'article').map(node => node.props['data-attribution']),
+    ['human', 'agent', 'system']
   )
-  assert.strictEqual(ambiguous.dispatches().length, 2)
+  assert.match(textContent(app.tree), /@agent is ordinary message content/, 'message text is displayed, never parsed as routing syntax')
 })
 
-test('separate submits carry different dispatch_ids', async () => {
-  const { dispatches, handler } = await loadPlugin()
+test('renders distinct channel-empty and transcript-empty states', async () => {
+  const noChannels = await loadRelay({ channels: [] })
+  const emptyChannels = noChannels.mount()
 
-  await handler({ text: '@claude first' })
-  await handler({ text: '@claude second' })
-  await handler({ text: '@claude first' })
+  await emptyChannels.settle()
+  const channelState = findAll(emptyChannels.tree, node => node.type === 'empty-state')[0]
+  assert.strictEqual(channelState.props.title, 'No Relay channels yet')
 
-  const ids = dispatches().map(call => call.options.body.dispatch_id)
+  const noMessages = await loadRelay({ histories: { general: { messages: [] } } })
+  const emptyTranscript = noMessages.mount()
 
-  assert.strictEqual(ids.length, 3)
-  assert.strictEqual(new Set(ids).size, 3, 'a new submit is a new attempt, even with identical text')
+  await emptyTranscript.settle()
+  const transcriptState = findAll(emptyTranscript.tree, node => node.type === 'empty-state').find(node => node.props.title === 'No messages in this channel yet')
+  assert.ok(transcriptState, 'an existing channel has its own transcript-empty state')
 })
 
-test('a hostile draft shape cannot break the composer', async () => {
-  const { dispatches, handler } = await loadPlugin()
+test('401 and 403 move the page into the authorization state and post only to the scoped authorize endpoint', async () => {
+  for (const status of [401, 403]) {
+    const relay = await loadRelay({
+      rest: async path => {
+        if (path === '/connection/status') {
+          throw responseError(status, 'Relay login expired')
+        }
+        if (path === '/connection/authorize') {
+          return { ok: true }
+        }
+        throw new Error(`unexpected ${path}`)
+      }
+    })
+    const app = relay.mount()
 
-  for (const draft of [{}, { text: '' }, { text: 42 }, { attachments: [] }, { text: null }]) {
-    assert.strictEqual(await handler(draft), draft)
+    await app.settle()
+    assert.strictEqual(findAll(app.tree, node => node.props?.['data-connection'] === 'auth_required').length, 1, `${status} requires authorization`)
+
+    findButton(app.tree, 'Authorize Relay').props.onClick()
+    await app.settle()
+
+    assert.deepStrictEqual(
+      relay.calls.filter(call => call.path === '/connection/authorize'),
+      [{ options: { method: 'POST' }, path: '/connection/authorize' }]
+    )
   }
-
-  assert.strictEqual(dispatches().length, 0)
 })
 
-test('a throwing host.state read degrades to pass-through', async () => {
-  const { dispatches, handler } = await loadPlugin({
-    sessionId: () => {
-      throw new Error('no bridge')
+test('offline refresh preserves the stale transcript read-only and keeps the draft', async () => {
+  let statusChecks = 0
+  const relay = await loadRelay({
+    histories: { general: { messages: [{ authorType: 'human', id: 'old', text: 'Cached message' }] } },
+    rest: async path => {
+      if (path === '/connection/status') {
+        statusChecks += 1
+        return statusChecks === 1 ? { status: 'ready' } : { status: 'offline' }
+      }
+      if (path === '/channels') {
+        return { channels: [{ id: 'general', name: 'General' }] }
+      }
+      if (path.includes('/messages?limit=50')) {
+        return { messages: [{ authorType: 'human', id: 'old', text: 'Cached message' }] }
+      }
+      throw new Error(`unexpected ${path}`)
     }
   })
-  const draft = { text: '@claude review this' }
+  const app = relay.mount()
 
-  assert.strictEqual(await handler(draft), draft)
-  assert.strictEqual(dispatches().length, 0)
+  await app.settle()
+  textarea(app).props.onChange({ target: { value: 'Keep this draft' } })
+  findButton(app.tree, 'Refresh').props.onClick()
+  await app.settle()
+
+  assert.strictEqual(findAll(app.tree, node => node.props?.['data-connection'] === 'offline').length, 1)
+  assert.match(textContent(app.tree), /Cached message/)
+  assert.strictEqual(textarea(app).props.value, 'Keep this draft')
+  assert.strictEqual(textarea(app).props.readOnly, true)
+})
+
+test('an ambiguous post keeps a retry affordance and reuses its exact clientMessageId', async () => {
+  let attempts = 0
+  const relay = await loadRelay({
+    post: async () => {
+      attempts += 1
+      if (attempts === 1) {
+        throw new Error('socket hang up')
+      }
+      return { ok: true }
+    }
+  })
+  const app = relay.mount()
+
+  await app.settle()
+  textarea(app).props.onChange({ target: { value: 'No duplicates please' } })
+  findAll(app.tree, node => node.type === 'form')[0].props.onSubmit({ preventDefault() {} })
+  await app.settle()
+
+  const retry = findButton(app.tree, 'Retry send')
+  assert.strictEqual(relay.posts().length, 1)
+  const firstId = relay.posts()[0].options.body.clientMessageId
+
+  retry.props.onClick()
+  await app.settle()
+
+  assert.strictEqual(relay.posts().length, 2)
+  assert.strictEqual(relay.posts()[1].options.body.clientMessageId, firstId, 'manual retry keeps the original client message id')
+  assert.strictEqual(textarea(app).props.value, '', 'a confirmed retry clears the draft')
+  assert.ok(relay.histories().length >= 3, 'both the ambiguous post and its manual retry immediately reconcile history')
+})
+
+test('socket frames and the visible-page 3s poll both refresh the selected latest window', async () => {
+  const relay = await loadRelay()
+  const app = relay.mount()
+
+  await app.settle()
+  assert.strictEqual(relay.socketHandlers.length, 1)
+  assert.strictEqual(relay.socketHandlers[0].path, '/events')
+  assert.deepStrictEqual([...relay.timers.values()].map(timer => timer.delay), [3_000])
+  assert.strictEqual(relay.histories().length, 1)
+
+  relay.dispatchSocket({ type: 'message.created' })
+  await app.settle()
+  assert.strictEqual(relay.histories().length, 2, 'a scoped socket event forwards to the current transcript refresh')
+
+  relay.tickPoll()
+  await app.settle()
+  assert.strictEqual(relay.histories().length, 3, 'the mounted page polls the latest 50-message window every three seconds')
+
+  app.dispose()
+  assert.strictEqual(relay.socketHandlers.length, 0)
+  assert.strictEqual(relay.timers.size, 0, 'unmount stops the visible-page fallback')
+})
+
+test('malformed, 404, archived, and generic errors remain recoverable', async () => {
+  const malformed = await loadRelay({ histories: { general: { nope: true } } })
+  const malformedApp = malformed.mount()
+
+  await malformedApp.settle()
+  assert.strictEqual(findAll(malformedApp.tree, node => node.type === 'error-state')[0].props.title, 'Transcript could not be loaded')
+
+  const missing = await loadRelay({
+    rest: async path => {
+      if (path === '/connection/status') return { status: 'ready' }
+      if (path === '/channels') return { channels: [{ id: 'general', name: 'General' }] }
+      if (path.includes('/messages?limit=50')) throw responseError(404, 'channel unavailable')
+      throw new Error(`unexpected ${path}`)
+    }
+  })
+  const missingApp = missing.mount()
+
+  await missingApp.settle()
+  const missingState = findAll(missingApp.tree, node => node.type === 'error-state')[0]
+  assert.strictEqual(missingState.props.title, 'Transcript could not be loaded')
+  assert.ok(missingState.props.action.props.onClick, '404 exposes a retry action rather than trapping the page')
+
+  const archived = await loadRelay({ histories: { general: { archived: true } } })
+  const archivedApp = archived.mount()
+
+  await archivedApp.settle()
+  assert.ok(findAll(archivedApp.tree, node => node.type === 'empty-state').some(node => node.props.title === 'Channel archived'))
+
+  const generic = await loadRelay({
+    rest: async path => {
+      if (path === '/connection/status') return { status: 'ready' }
+      if (path === '/channels') throw new Error('upstream down')
+      throw new Error(`unexpected ${path}`)
+    }
+  })
+  const genericApp = generic.mount()
+
+  await genericApp.settle()
+  assert.strictEqual(findAll(genericApp.tree, node => node.type === 'error-state')[0].props.title, 'Channels could not be loaded')
 })

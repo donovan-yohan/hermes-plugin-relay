@@ -1,8 +1,8 @@
 {
   "name": "hermes-plugin-relay",
-  "label": "Relay Participants",
-  "description": "Backend for external agent participants (@claude, @codex) in the Hermes transcript.",
-  "icon": "Users",
-  "version": "0.1.0",
+  "label": "Relay Desktop Backend",
+  "description": "Backend-only loopback proxy for Relay channels in Hermes Desktop.",
+  "icon": "MessagesSquare",
+  "version": "0.2.0.dev0",
   "api": "plugin_api.py"
 }

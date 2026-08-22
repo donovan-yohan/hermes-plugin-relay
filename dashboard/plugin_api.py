@@ -1,40 +1,32 @@
-"""REST surface for hermes-plugin-relay (participant seam contract v1 section 6).
+"""Standalone Dashboard backend for the Relay Desktop proxy.
 
-Mounted by the Hermes dashboard at ``/api/plugins/hermes-plugin-relay/``. HTTP
-routes carry no auth dependency of their own: they sit behind the dashboard's
-global auth middleware, the same arrangement the bundled kanban plugin uses.
-
-Import note
------------
-The host loads this file as a *flat* module
-(``spec_from_file_location("hermes_dashboard_plugin_hermes-plugin-relay", …)``),
-so relative imports are impossible here. :func:`_plugin_package_name` finds the
-already-imported plugin package instead of loading a second copy — two copies
-would mean two runtime managers, and the REST surface would stop sharing state
-with the Hermes tools.
+Hermes loads this file as a flat module, so package lookup intentionally mirrors
+its dashboard loader instead of using a relative import.
 """
 
 from __future__ import annotations
 
 import importlib
 import importlib.util
-import logging
+import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
-
-log = logging.getLogger(__name__)
 
 router = APIRouter()
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _FALLBACK_PACKAGE = "hermes_plugin_relay"
+MAX_DESKTOP_REQUEST_BYTES = 64 * 1024
+
 
 def _plugin_package_name() -> str:
-    """Return the import name of the already-loaded plugin package."""
+    """Find the loaded plugin package or load one shared fallback package."""
 
     root = str(_PLUGIN_ROOT)
     for name, module in list(sys.modules.items()):
@@ -44,19 +36,17 @@ def _plugin_package_name() -> str:
             try:
                 if str(Path(entry).resolve()) == root:
                     return name
-            except OSError:  # pragma: no cover - unreadable path entry
+            except OSError:
                 continue
-
     if _FALLBACK_PACKAGE in sys.modules:
         return _FALLBACK_PACKAGE
-
     spec = importlib.util.spec_from_file_location(
         _FALLBACK_PACKAGE,
         _PLUGIN_ROOT / "__init__.py",
         submodule_search_locations=[root],
     )
-    if spec is None or spec.loader is None:  # pragma: no cover - packaging error
-        raise ImportError(f"cannot load hermes-plugin-relay package from {root}")
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load the Relay plugin package")
     module = importlib.util.module_from_spec(spec)
     module.__package__ = _FALLBACK_PACKAGE
     module.__path__ = [root]  # type: ignore[attr-defined]
@@ -66,148 +56,190 @@ def _plugin_package_name() -> str:
 
 
 _PKG = _plugin_package_name()
-_manager_mod = importlib.import_module(f"{_PKG}.runtime.manager")
+_proxy_mod = importlib.import_module(f"{_PKG}.relay_proxy")
 
-DispatchCapacityError = _manager_mod.DispatchCapacityError
-DispatchValidationError = _manager_mod.DispatchValidationError
-ParticipantNotFoundError = _manager_mod.ParticipantNotFoundError
-RelayRuntimeError = _manager_mod.RelayRuntimeError
-SeamUnavailableError = _manager_mod.SeamUnavailableError
-
-#: Statuses the runtime's own error classes declare. Re-exported for tests.
-SEAM_UNAVAILABLE_STATUS = SeamUnavailableError.http_status
-CAPACITY_STATUS = DispatchCapacityError.http_status
-
-
-def _manager() -> Any:
-    return _manager_mod.get_manager()
+RelayAuthRequiredError = _proxy_mod.RelayAuthRequiredError
+RelayConfigurationError = _proxy_mod.RelayConfigurationError
+RelayMalformedResponseError = _proxy_mod.RelayMalformedResponseError
+RelayProxyError = _proxy_mod.RelayProxyError
+RelayResponseTooLargeError = _proxy_mod.RelayResponseTooLargeError
+RelayUnavailableError = _proxy_mod.RelayUnavailableError
+RelayUpstreamError = _proxy_mod.RelayUpstreamError
+MAX_CHANNEL_ID_BYTES = _proxy_mod.MAX_CHANNEL_ID_BYTES
+MAX_CLIENT_MESSAGE_ID_BYTES = _proxy_mod.MAX_CLIENT_MESSAGE_ID_BYTES
+MAX_HISTORY_LIMIT = _proxy_mod.MAX_HISTORY_LIMIT
+MAX_MESSAGE_TEXT_BYTES = _proxy_mod.MAX_MESSAGE_TEXT_BYTES
 
 
-def _fail(status_code: int, message: str) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content={"ok": False, "error": message})
+def _proxy() -> Any:
+    return _proxy_mod.get_relay_proxy()
 
 
-def _require_str(body: Any, key: str, *, strip: bool = True) -> str:
-    """Pull a required non-empty string. ``strip=False`` preserves the value."""
-
-    value = body.get(key) if isinstance(body, dict) else None
-    if not isinstance(value, str) or not value.strip():
-        raise DispatchValidationError(f"'{key}' is required and must be a non-empty string")
-    return value.strip() if strip else value
+def _error(status_code: int, code: str, message: str, *, retryable: bool = False) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"code": code, "message": message, "retryable": retryable}},
+    )
 
 
-def _error_response(action: str, exc: BaseException) -> JSONResponse:
-    """Answer a failed request, choosing status AND body by classification.
+def _relay_error(error: RelayProxyError) -> JSONResponse:
+    """Map trusted classifications, never an upstream exception message/body."""
 
-    ``pre_acceptance`` is the discriminator, and it decides two things at once:
-
-    * **Status.** A 4xx tells the Desktop composer middleware "nothing
-      happened", which licenses it to pass the draft on to Hermes. Only an
-      error that provably had no side effect may claim that, so anything not
-      marked pre-acceptance is forced to 5xx — an unclassified failure is
-      ambiguous, and downgrading it to 4xx would duplicate the human's message
-      when the user row had in fact already been appended.
-    * **Body.** A pre-acceptance error describes the REQUEST (bad field,
-      unknown participant, seam absent, at capacity), so its message is safe
-      and useful to the caller. Anything else describes what went wrong INSIDE
-      the runtime and can carry filesystem paths or provider diagnostics — for
-      example the joined adapter spawn errors the manager raises when no turn
-      could be queued. Those go to the log only.
-    """
-
-    status = getattr(exc, "http_status", 500)
-    if getattr(exc, "pre_acceptance", False):
-        return _fail(status, str(exc))
-    log.warning("relay: %s failed: %s", action, exc, exc_info=True)
-    return _fail(status if status >= 500 else 500, f"{action} failed unexpectedly")
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
-
-@router.get("/participants")
-def list_participants(session_id: Optional[str] = None) -> Any:
-    """Honest participant roster.
-
-    ``session_id`` is optional and only adds the session-scoped ``busy`` status.
-    """
-
-    try:
-        participants: List[Dict[str, Any]] = _manager().roster(session_id)
-    except Exception:  # noqa: BLE001 - roster must never 500 the dashboard
-        # Detail goes to the log only: raw exception text can carry paths and
-        # provider diagnostics that do not belong in an HTTP body.
-        log.warning("relay: roster failed", exc_info=True)
-        return _fail(500, "failed to build the participant roster")
-    return {"participants": participants}
-
-
-@router.post("/dispatch")
-def dispatch(body: Any = Body(default=None)) -> Any:
-    """Fan one human submit out to every mentioned participant, exactly once.
-
-    ``dispatch_id`` is generated once per submit attempt by the client and
-    reused verbatim on transport retry; duplicates return the same turn refs and
-    perform no second user-row append and no second fanout.
-    """
-
-    if not isinstance(body, dict):
-        return _fail(400, "request body must be a JSON object")
-
-    try:
-        session_id = _require_str(body, "session_id")
-        dispatch_id = _require_str(body, "dispatch_id")
-        # The human's text is persisted verbatim, so it must not be stripped.
-        text = _require_str(body, "text", strip=False)
-    except DispatchValidationError as exc:
-        return _error_response("dispatch", exc)
-
-    raw_mentions = body.get("mentions")
-    if not isinstance(raw_mentions, list) or not raw_mentions:
-        return _fail(400, "'mentions' is required and must be a non-empty list of handles")
-    mentions = [m.strip() for m in raw_mentions if isinstance(m, str) and m.strip()]
-    if not mentions:
-        return _fail(400, "'mentions' must contain at least one handle")
-
-    append_user_message = body.get("append_user_message", True)
-    if not isinstance(append_user_message, bool):
-        return _fail(400, "'append_user_message' must be a boolean")
-
-    try:
-        result = _manager().dispatch_group(
-            session_id,
-            dispatch_id,
-            text,
-            mentions,
-            append_user_message=append_user_message,
+    if isinstance(error, RelayAuthRequiredError):
+        return _error(
+            error.status_code,
+            "auth_required",
+            "Relay authorization is required",
         )
-    except Exception as exc:  # noqa: BLE001
-        return _error_response("dispatch", exc)
-    # A committed partial result (some participants queued, some failed) is a
-    # 200: the submit was accepted and retrying the same dispatch_id replays
-    # this exact body. `ok` and `failed` carry the real outcome.
-    return result
+    if isinstance(error, RelayUpstreamError):
+        if error.status_code == 404:
+            return _error(404, "not_found", "Relay resource was not found")
+        if error.status_code == 409:
+            return _error(409, "conflict", "Relay reported a conflict")
+        return _error(error.status_code, "relay_rejected", "Relay rejected the request")
+    if isinstance(error, (RelayUnavailableError, RelayResponseTooLargeError)):
+        return _error(503, "relay_unavailable", "Relay is unavailable", retryable=True)
+    if isinstance(error, (RelayConfigurationError, RelayMalformedResponseError)):
+        return _error(502, "relay_invalid_response", "Relay returned an invalid response", retryable=True)
+    return _error(502, "relay_error", "Relay request failed", retryable=True)
 
 
-@router.post("/interrupt")
-def interrupt(body: Any = Body(default=None)) -> Any:
-    """Best-effort interrupt of a participant's in-flight turn."""
+class RequestValidationError(Exception):
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        self.status_code = status_code
+        self.code = code
+        self.message = message
 
+
+async def _read_request_body(request: Request) -> bytes:
+    """Read a bounded body, including chunked requests with no length header."""
+
+    header = request.headers.get("content-length")
+    if header is not None:
+        try:
+            length = int(header)
+            if length < 0 or length > MAX_DESKTOP_REQUEST_BYTES:
+                raise ValueError
+        except ValueError:
+            raise RequestValidationError(413, "request_too_large", "Request body is too large")
+    data = bytearray()
+    async for chunk in request.stream():
+        data.extend(chunk)
+        if len(data) > MAX_DESKTOP_REQUEST_BYTES:
+            raise RequestValidationError(413, "request_too_large", "Request body is too large")
+    return bytes(data)
+
+
+async def _read_json_object(request: Request) -> Mapping[str, Any]:
+    """Read a JSON object under a hard byte cap, including chunked requests."""
+
+    data = await _read_request_body(request)
+    try:
+        body = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RequestValidationError(400, "invalid_json", "Request body must be JSON") from exc
     if not isinstance(body, dict):
-        return _fail(400, "request body must be a JSON object")
+        raise RequestValidationError(400, "invalid_body", "Request body must be a JSON object")
+    return body
 
+
+def _channel_id(value: str) -> str:
+    if not value or len(value.encode("utf-8")) > MAX_CHANNEL_ID_BYTES:
+        raise RequestValidationError(400, "invalid_channel", "Channel id is invalid")
+    return value
+
+
+def _history_limit(request: Request) -> int:
+    values = request.query_params.getlist("limit")
+    if len(values) > 1 or any(key != "limit" for key in request.query_params):
+        raise RequestValidationError(400, "invalid_query", "Only one limit query parameter is supported")
+    if not values:
+        return MAX_HISTORY_LIMIT
+    raw = values[0]
+    if not raw.isascii() or not raw.isdecimal():
+        raise RequestValidationError(400, "invalid_limit", "Limit must be an integer")
+    limit = int(raw)
+    if not 1 <= limit <= MAX_HISTORY_LIMIT:
+        raise RequestValidationError(400, "invalid_limit", f"Limit must be between 1 and {MAX_HISTORY_LIMIT}")
+    return limit
+
+
+def _post_body(value: Mapping[str, Any]) -> dict[str, str]:
+    expected = {"text", "format", "clientMessageId"}
+    if set(value) != expected:
+        raise RequestValidationError(
+            400,
+            "invalid_body",
+            "Message body must contain exactly text, format, and clientMessageId",
+        )
+    text = value["text"]
+    message_format = value["format"]
+    client_message_id = value["clientMessageId"]
+    if not isinstance(text, str) or not text.strip():
+        raise RequestValidationError(400, "invalid_text", "Text must be a non-empty string")
+    if len(text.encode("utf-8")) > MAX_MESSAGE_TEXT_BYTES:
+        raise RequestValidationError(413, "text_too_large", "Text is too large")
+    if message_format not in {"markdown", "text"}:
+        raise RequestValidationError(400, "invalid_format", "Format must be markdown or text")
+    if not isinstance(client_message_id, str) or not client_message_id:
+        raise RequestValidationError(
+            400, "invalid_client_message_id", "clientMessageId must be a non-empty string"
+        )
+    if len(client_message_id.encode("utf-8")) > MAX_CLIENT_MESSAGE_ID_BYTES:
+        raise RequestValidationError(
+            413, "client_message_id_too_large", "clientMessageId is too large"
+        )
+    # The caller's three values are deliberately returned unmodified. In
+    # particular, retries must send the exact same clientMessageId to Relay.
+    return {"text": text, "format": message_format, "clientMessageId": client_message_id}
+
+
+@router.get("/connection/status")
+async def connection_status() -> Any:
+    return (await run_in_threadpool(_proxy().status)).to_wire()
+
+
+@router.post("/connection/authorize")
+async def connection_authorize(request: Request) -> Any:
     try:
-        session_id = _require_str(body, "session_id")
-        participant_id = _require_str(body, "participant_id")
-    except DispatchValidationError as exc:
-        return _error_response("interrupt", exc)
+        # This endpoint has no caller-controlled parameters. Reject a body so a
+        # renderer cannot smuggle client metadata, scope, or a grant through it.
+        if await _read_request_body(request):
+            raise RequestValidationError(400, "invalid_body", "Authorization does not accept a body")
+        return (await run_in_threadpool(_proxy().authorize)).to_wire()
+    except RequestValidationError as error:
+        return _error(error.status_code, error.code, error.message)
+    except RelayProxyError as error:
+        return _relay_error(error)
 
+
+@router.get("/channels")
+async def list_channels() -> Any:
     try:
-        return _manager().interrupt(session_id, participant_id)
-    except Exception as exc:  # noqa: BLE001
-        return _error_response("interrupt", exc)
+        return await run_in_threadpool(_proxy().list_channels)
+    except RelayProxyError as error:
+        return _relay_error(error)
 
 
-__all__ = ["CAPACITY_STATUS", "SEAM_UNAVAILABLE_STATUS", "router"]
+@router.get("/channels/{channel_id}/messages")
+async def channel_history(channel_id: str, request: Request) -> Any:
+    try:
+        return await run_in_threadpool(_proxy().history, _channel_id(channel_id), _history_limit(request))
+    except RequestValidationError as error:
+        return _error(error.status_code, error.code, error.message)
+    except RelayProxyError as error:
+        return _relay_error(error)
+
+
+@router.post("/channels/{channel_id}/messages")
+async def post_channel_message(channel_id: str, request: Request) -> Any:
+    try:
+        body = _post_body(await _read_json_object(request))
+        return await run_in_threadpool(_proxy().post, _channel_id(channel_id), body)
+    except RequestValidationError as error:
+        return _error(error.status_code, error.code, error.message)
+    except RelayProxyError as error:
+        return _relay_error(error)
+
+
+__all__ = ["MAX_DESKTOP_REQUEST_BYTES", "router"]

@@ -1,8 +1,8 @@
-"""hermes-plugin-relay — backend-only Relay proxy for Hermes Desktop.
+"""hermes-plugin-relay — native Relay workspace for Hermes Desktop.
 
 The standalone plugin owns no participant/provider runtime, tools, subprocesses,
-or persisted state. ``dashboard/plugin_api.py`` is the only integration surface
-and keeps the Relay credential in process memory.
+or persisted state. ``desktop/plugin.js`` renders the workspace while
+``dashboard/plugin_api.py`` keeps Relay network access and credentials backend-side.
 """
 
 from __future__ import annotations

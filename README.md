@@ -1,14 +1,24 @@
 # hermes-plugin-relay
 
-A thin, backend-only proxy between Hermes Desktop and a local Relay hub. This
-is a breaking pivot from the former participant/provider runtime: there are no
-Hermes tools, provider adapters, subprocesses, participant skills, persistent
-session records, or compatibility endpoints.
+A native Hermes Desktop workspace for channels on a local Relay hub. The
+uncompiled Desktop plugin contributes a `/relay` page and sidebar entry; a thin
+Python dashboard API keeps Relay credentials and network access out of the
+renderer.
 
-The Python dashboard API is mounted at
-`/api/plugins/hermes-plugin-relay/`; `desktop/plugin.js` is intentionally a
-separate frontend-owned surface. The backend has no CORS middleware and does
-not expose `/events`.
+This is a breaking pivot from the former participant/provider runtime: there
+are no Hermes tools, provider adapters, subprocesses, participant skills,
+persistent session records, or compatibility endpoints. The backend has no
+CORS middleware and does not expose `/events`; the visible page uses a bounded
+three-second refresh fallback.
+
+## Desktop workspace
+
+The `/relay` page lists accessible Relay channels, renders the selected
+channel's latest 50 messages with human/agent/system attribution, and posts
+Markdown messages with a stable client-generated idempotency key. It keeps a
+stale transcript and unsent draft visible while Relay is offline, and renders
+authorization, empty, archived, malformed, missing-channel, and upstream-error
+states separately.
 
 ## Configure the local Relay connection
 
@@ -37,7 +47,9 @@ RELAY_IDE_OPERATOR_GRANT=relay-ohg-v1.…
 
 `POST /connection/authorize` redeems that grant with client id
 `desktop-plugin-backend`, the read/write context capability pair, and a fixed
-15-minute maximum TTL. The raw issued credential remains in process memory;
+15-minute maximum TTL. The approved grant must carry an exact `channelIds`
+scope; Relay inherits that scope when minting the credential, so the plugin
+cannot widen access during onboarding. The raw issued credential remains in process memory;
 it is never sent to Desktop, persisted, logged, added to URLs, or put in plugin
 configuration. Every supplied or issued credential is locally bounded to 15
 minutes and is cleared on expiry or when Relay responds 401 or 403.
@@ -72,7 +84,8 @@ sender/source are not accepted or returned.
 ## Verify
 
 ```bash
-/home/donovanyohan/.hermes/hermes-agent/venv/bin/python -m pytest -q --ignore=tests/desktop
+python -m pytest -q
+npm test
 hermes plugins doctor /path/to/hermes-plugin-relay --ci
 ```
 

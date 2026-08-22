@@ -1,13 +1,14 @@
 manifest_version: 2
 name: hermes-plugin-relay
-label: Relay Desktop Backend
+label: Relay Workspace
 version: 0.2.0.dev0
 kind: standalone
 author: Nous Research
 description: >
-  Backend-only, loopback-only proxy from Hermes Desktop to Relay's stable channel
-  API. It owns an operator-client credential in process memory and exposes no
-  providers, participants, tools, credentials, grants, or streaming endpoints.
+  Native Hermes Desktop workspace for a local Relay hub. A loopback-only backend
+  owns the short-lived operator-client credential while the renderer lists
+  channels, shows transcripts, and posts messages. It exposes no provider or
+  participant runtime, Hermes tools, credential material, or fake stream.
 
 requires_env: []
 optional_env:

@@ -1,9 +1,13 @@
-# Hermes Desktop backend API
+# Hermes Desktop Relay workspace
 
 The Desktop renderer talks only to the plugin-local REST namespace:
 `/api/plugins/hermes-plugin-relay/`. Hermes mounts `dashboard/plugin_api.py`
 from this standalone plugin; the renderer cannot address Relay directly or read
 plugin process environment variables.
+
+`desktop/plugin.js` contributes the full `/relay` route and sidebar entry. It
+renders connection state, channel inventory, the selected transcript, and a
+message composer without touching Hermes sessions or composer middleware.
 
 This backend deliberately exposes no `/events` endpoint. Desktop refreshes its
 visible page every three seconds instead of pretending that a local poll is a
@@ -54,6 +58,10 @@ Neither token nor grant is ever returned to Desktop JavaScript, included in a
 URL, written to config/files, placed in test fixtures, or logged by this
 backend. A missing, consumed, expired, or revoked credential/grant is reported
 as `auth_required`.
+
+Grant-backed onboarding requires an approved handshake grant with an exact
+`channelIds` scope. Relay inherits that scope when the issue request omits one;
+the plugin cannot broaden or replace the approved channel set.
 
 ## Vertical-slice debt
 

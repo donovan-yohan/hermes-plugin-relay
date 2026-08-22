@@ -45,7 +45,8 @@ The proxy reads `RELAY_IDE_URL` once at process start (default
 `http://127.0.0.1:3456`). It accepts only literal loopback HTTP roots:
 `localhost`, `127.0.0.1`, or `[::1]`, with no userinfo, path, query, or
 fragment. There is no CORS policy because this is a same-origin Hermes plugin
-backend.
+backend. `localhost` is canonicalized to `127.0.0.1`, ambient proxies are
+disabled, and redirects are rejected before another credential-bearing hop.
 
 `RELAY_IDE_OPERATOR_CLIENT_TOKEN` supplies an existing Relay operator-client
 credential. If that is absent, `POST /connection/authorize` may redeem the

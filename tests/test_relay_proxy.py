@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from io import BytesIO
 
 import pytest
@@ -17,6 +18,8 @@ from hermes_plugin_relay.relay_proxy import (
     RelayProxy,
     RelayResponseTooLargeError,
     RelayUnavailableError,
+    UrlLibRelayTransport,
+    _NoRedirectHandler,
     _decode_json,
     _read_limited,
     project_history,
@@ -77,7 +80,7 @@ def message(message_id: str = "chm:one") -> dict:
 @pytest.mark.parametrize(
     ("url", "expected"),
     [
-        ("http://localhost:3456", "http://localhost:3456"),
+        ("http://localhost:3456", "http://127.0.0.1:3456"),
         ("http://127.0.0.1", "http://127.0.0.1"),
         ("http://[::1]:3456/", "http://[::1]:3456"),
     ],
@@ -95,11 +98,37 @@ def test_loopback_root_urls_are_accepted(url, expected):
         "http://127.0.0.1:3456/api",
         "http://127.0.0.1:3456/?q=1",
         "http://127.0.0.1:3456/#fragment",
+        "http://[::ffff:127.0.0.1]:3456",
     ],
 )
 def test_non_loopback_or_non_root_urls_are_rejected(url):
     with pytest.raises(RelayConfigurationError):
         validate_relay_base_url(url)
+
+
+def test_transport_disables_ambient_proxies_and_redirects(monkeypatch):
+    resolved_hosts: list[str] = []
+
+    def reject_resolution(host, *_args, **_kwargs):
+        resolved_hosts.append(host)
+        raise socket.gaierror("test resolution stopped")
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setattr(socket, "getaddrinfo", reject_resolution)
+    transport = UrlLibRelayTransport(timeout_seconds=0.1)
+    with pytest.raises(RelayUnavailableError):
+        transport.request(
+            method="GET",
+            url="http://relay.invalid/status",
+            headers={"Authorization": "Bearer test-secret"},
+            body=None,
+        )
+    assert resolved_hosts == ["relay.invalid"]
+
+    redirect = _NoRedirectHandler().redirect_request(
+        None, None, 302, "Found", {}, "http://example.test"
+    )
+    assert redirect is None
 
 
 def test_status_classifies_ready_offline_auth_and_invalid_url_without_connecting():
@@ -254,6 +283,8 @@ def test_post_does_not_retry_a_recoverable_upstream_failure():
 
 
 def test_relay_response_size_and_json_are_bounded_before_projection():
+    valid_relay_history = b"x" * (4 * 1024 * 1024 + 4096)
+    assert _read_limited(BytesIO(valid_relay_history), {}) == valid_relay_history
     with pytest.raises(RelayResponseTooLargeError):
         _read_limited(BytesIO(b"x" * (MAX_RELAY_RESPONSE_BYTES + 1)), {})
     with pytest.raises(RelayResponseTooLargeError):

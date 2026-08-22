@@ -20,7 +20,9 @@ from urllib.parse import quote, urlsplit
 PLUGIN_ID = "hermes-plugin-relay"
 DEFAULT_RELAY_IDE_URL = "http://127.0.0.1:3456"
 RELAY_REQUEST_TIMEOUT_SECONDS = 5.0
-MAX_RELAY_RESPONSE_BYTES = 1024 * 1024
+# Relay's stable history route permits a 4 MiB message budget before JSON
+# framing. Keep a bounded envelope with enough headroom for that valid payload.
+MAX_RELAY_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_MESSAGE_TEXT_BYTES = 64 * 1024
 MAX_CLIENT_MESSAGE_ID_BYTES = 512
 MAX_CHANNEL_ID_BYTES = 512
@@ -104,7 +106,20 @@ def validate_relay_base_url(value: str) -> str:
         or (port is not None and not 1 <= port <= 65535)
     ):
         raise RelayConfigurationError()
-    return f"http://{parsed.netloc}"
+    # Never leave `localhost` to resolver policy: canonicalize it to a literal
+    # loopback address before any credential-bearing request is constructed.
+    host = "127.0.0.1" if parsed.hostname == "localhost" else parsed.hostname
+    authority = f"[{host}]" if host == "::1" else host
+    if port is not None:
+        authority = f"{authority}:{port}"
+    return f"http://{authority}"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Fail closed on redirects so authorization never follows another hop."""
+
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
 
 
 def _read_limited(stream: Any, headers: Mapping[str, str]) -> bytes:
@@ -137,6 +152,12 @@ class UrlLibRelayTransport:
 
     def __init__(self, timeout_seconds: float = RELAY_REQUEST_TIMEOUT_SECONDS) -> None:
         self._timeout_seconds = timeout_seconds
+        # Loopback traffic must not inherit ambient proxy settings. Combined
+        # with the redirect guard, every credential-bearing hop stays literal.
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _NoRedirectHandler(),
+        )
 
     def request(
         self,
@@ -148,7 +169,7 @@ class UrlLibRelayTransport:
     ) -> RelayHttpResponse:
         request = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+            with self._opener.open(request, timeout=self._timeout_seconds) as response:
                 return RelayHttpResponse(
                     status_code=response.status,
                     payload=_decode_json(_read_limited(response, response.headers)),

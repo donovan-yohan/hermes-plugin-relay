@@ -60,7 +60,7 @@ test('lists once, selects one channel, loads its 50-message window, and posts on
     ],
     histories: {
       general: { messages: [] },
-      ops: { messages: [{ author: { type: 'human' }, id: 'ops-1', text: 'hello' }] }
+      ops: { messages: [{ body: { format: 'markdown', text: 'hello' }, id: 'ops-1', sender: { kind: 'human' } }] }
     }
   })
   const app = relay.mount()

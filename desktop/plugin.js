@@ -22,6 +22,7 @@ const RELAY_ROUTE = '/relay'
 const POLL_INTERVAL_MS = 3_000
 const HISTORY_LIMIT = 50
 const CONNECTION_STATES = new Set(['ready', 'offline', 'auth_required', 'error'])
+const NON_RETRYABLE_STATUS_CODES = new Set([400, 404, 409, 413])
 
 let pluginContext = null
 
@@ -51,6 +52,29 @@ function isAuthError(error) {
   const status = statusCode(error)
 
   return status === 401 || status === 403
+}
+
+function isRetryableError(error) {
+  if (typeof error?.retryable === 'boolean') {
+    return error.retryable
+  }
+
+  const message = text(error?.message)
+  const jsonStart = message.indexOf('{')
+
+  if (jsonStart >= 0) {
+    try {
+      const envelope = JSON.parse(message.slice(jsonStart))
+
+      if (typeof envelope?.error?.retryable === 'boolean') {
+        return envelope.error.retryable
+      }
+    } catch {
+      // Fall through to the stable HTTP classification below.
+    }
+  }
+
+  return !NON_RETRYABLE_STATUS_CODES.has(statusCode(error))
 }
 
 function normalizeConnection(response) {
@@ -537,7 +561,11 @@ function RelayPage() {
       const attempt = { channelId, clientMessageId, text: messageText }
 
       retryRef.current = attempt
-      setRetry({ ...attempt, error: isAuthError(error) ? 'Relay authorization is required before sending.' : errorMessage(error, 'Relay could not confirm this message. Retry safely with the same message id.') })
+      setRetry({
+        ...attempt,
+        error: isAuthError(error) ? 'Relay authorization is required before sending.' : errorMessage(error, 'Relay could not confirm this message. Retry safely with the same message id.'),
+        retryable: isRetryableError(error)
+      })
       noteAuthRequired(error)
     } finally {
       setSending(false)
@@ -549,20 +577,6 @@ function RelayPage() {
   useEffect(() => {
     void refreshPage()
   }, [refreshPage])
-
-  useEffect(() => {
-    if (typeof ctx?.socket !== 'function') {
-      return undefined
-    }
-
-    try {
-      return ctx.socket('/events', () => {
-        void refreshLatest()
-      })
-    } catch {
-      return undefined
-    }
-  }, [ctx, refreshLatest])
 
   useEffect(() => {
     if (connection.status !== 'ready' || !selectedChannelId) {
@@ -631,7 +645,9 @@ function RelayPage() {
                         role: 'alert',
                         children: [
                           jsx('span', { children: retry.error }),
-                          jsx(Button, { 'data-testid': 'retry-send', disabled: !canSend || retry.channelId !== selectedChannelId, onClick: () => void send(true), size: 'xs', type: 'button', variant: 'secondary', children: 'Retry send' })
+                          retry.retryable
+                            ? jsx(Button, { 'data-testid': 'retry-send', disabled: !canSend || retry.channelId !== selectedChannelId, onClick: () => void send(true), size: 'xs', type: 'button', variant: 'secondary', children: 'Retry send' })
+                            : null
                         ]
                       })
                     : null,

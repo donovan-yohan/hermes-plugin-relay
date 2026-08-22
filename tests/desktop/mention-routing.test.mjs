@@ -24,7 +24,7 @@ test('renders safe human, agent, and system attribution without parsing message 
         messages: [
           { body: { format: 'markdown', text: '@agent is ordinary message content' }, id: 'human-1', sender: { displayName: 'Ari', kind: 'human' } },
           { body: { format: 'markdown', text: 'Automated reply' }, id: 'agent-1', sender: { displayName: 'Codex', kind: 'agent' } },
-          { id: 'system-1', role: 'system', text: 'Channel opened' }
+          { body: { format: 'markdown', text: 'Channel opened' }, id: 'system-1', sender: { kind: 'system' } }
         ]
       }
     }
@@ -86,7 +86,7 @@ test('401 and 403 move the page into the authorization state and post only to th
 test('offline refresh preserves the stale transcript read-only and keeps the draft', async () => {
   let statusChecks = 0
   const relay = await loadRelay({
-    histories: { general: { messages: [{ authorType: 'human', id: 'old', text: 'Cached message' }] } },
+    histories: { general: { messages: [{ body: { format: 'markdown', text: 'Cached message' }, id: 'old', sender: { kind: 'human' } }] } },
     rest: async path => {
       if (path === '/connection/status') {
         statusChecks += 1
@@ -96,7 +96,7 @@ test('offline refresh preserves the stale transcript read-only and keeps the dra
         return { channels: [{ id: 'general', name: 'General' }] }
       }
       if (path.includes('/messages?limit=50')) {
-        return { messages: [{ authorType: 'human', id: 'old', text: 'Cached message' }] }
+        return { messages: [{ body: { format: 'markdown', text: 'Cached message' }, id: 'old', sender: { kind: 'human' } }] }
       }
       throw new Error(`unexpected ${path}`)
     }
@@ -145,26 +145,41 @@ test('an ambiguous post keeps a retry affordance and reuses its exact clientMess
   assert.ok(relay.histories().length >= 3, 'both the ambiguous post and its manual retry immediately reconcile history')
 })
 
-test('socket frames and the visible-page 3s poll both refresh the selected latest window', async () => {
+test('a deterministic rejected post preserves the draft without offering a doomed retry', async () => {
+  const relay = await loadRelay({
+    post: async () => {
+      throw responseError(413, '{"error":{"code":"message_too_large","retryable":false}}')
+    }
+  })
+  const app = relay.mount()
+
+  await app.settle()
+  textarea(app).props.onChange({ target: { value: 'Too large' } })
+  findAll(app.tree, node => node.type === 'form')[0].props.onSubmit({ preventDefault() {} })
+  await app.settle()
+
+  assert.strictEqual(
+    findAll(app.tree, node => node.type === 'button' && textContent(node) === 'Retry send').length,
+    0
+  )
+  assert.strictEqual(textarea(app).props.value, 'Too large')
+  assert.match(findAll(app.tree, node => node.props?.role === 'alert')[0].props.children[0].props.children, /message_too_large/)
+})
+
+test('the visible-page 3s poll refreshes the selected latest window and stops on unmount', async () => {
   const relay = await loadRelay()
   const app = relay.mount()
 
   await app.settle()
-  assert.strictEqual(relay.socketHandlers.length, 1)
-  assert.strictEqual(relay.socketHandlers[0].path, '/events')
+  assert.strictEqual(relay.socketHandlers.length, 0, 'the polling-only slice does not dial an unsupported socket')
   assert.deepStrictEqual([...relay.timers.values()].map(timer => timer.delay), [3_000])
   assert.strictEqual(relay.histories().length, 1)
 
-  relay.dispatchSocket({ type: 'message.created' })
-  await app.settle()
-  assert.strictEqual(relay.histories().length, 2, 'a scoped socket event forwards to the current transcript refresh')
-
   relay.tickPoll()
   await app.settle()
-  assert.strictEqual(relay.histories().length, 3, 'the mounted page polls the latest 50-message window every three seconds')
+  assert.strictEqual(relay.histories().length, 2, 'the mounted page polls the latest 50-message window every three seconds')
 
   app.dispose()
-  assert.strictEqual(relay.socketHandlers.length, 0)
   assert.strictEqual(relay.timers.size, 0, 'unmount stops the visible-page fallback')
 })
 

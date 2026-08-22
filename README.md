@@ -11,6 +11,20 @@ persistent session records, or compatibility endpoints. The backend has no
 CORS middleware and does not expose `/events`; the visible page uses a bounded
 three-second refresh fallback.
 
+## Install
+
+[Install in Hermes](hermes://plugin/install?repo=donovan-yohan/hermes-plugin-relay&enable=1),
+or use the CLI:
+
+```bash
+hermes plugins install donovan-yohan/hermes-plugin-relay --enable
+```
+
+The backend and Desktop halves are separately opt-in. After installation,
+enable **Relay** in Hermes Desktop under **Settings → Plugins**, then open
+`/relay` from the sidebar. Relay itself must be running locally with the
+operator-client credential endpoints described below.
+
 ## Desktop workspace
 
 The `/relay` page lists accessible Relay channels, renders the selected
@@ -29,8 +43,10 @@ RELAY_IDE_URL=http://127.0.0.1:3456
 ```
 
 Accepted hosts are `localhost`, `127.0.0.1`, and `[::1]`. HTTPS, remote hosts,
-userinfo, paths, queries, and fragments are rejected. Requests have bounded
-five-second transport timeouts and 1 MiB Relay response limits.
+userinfo, paths, queries, and fragments are rejected. `localhost` is
+canonicalized to `127.0.0.1`; ambient proxies and redirects are disabled so a
+credential-bearing request cannot leave loopback. Requests have bounded
+five-second transport timeouts and 8 MiB Relay response limits.
 
 Provide an existing Relay operator-client token only through the process
 environment:

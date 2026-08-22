@@ -87,9 +87,9 @@ function normalizeChannels(response) {
 }
 
 function normalizedAttribution(row) {
-  const candidate = text(row?.author?.type, text(row?.authorType, text(row?.author_type, text(row?.senderType, text(row?.sender_type, text(row?.role)))))).toLowerCase()
+  const candidate = text(row?.sender?.kind, text(row?.author?.type, text(row?.authorType, text(row?.author_type, text(row?.senderType, text(row?.sender_type, text(row?.role))))))).toLowerCase()
   const kind = candidate === 'human' || candidate === 'agent' || candidate === 'system' ? candidate : 'system'
-  const name = text(row?.author?.displayName, text(row?.author?.display_name, text(row?.authorName, text(row?.author_name, text(row?.senderName, text(row?.sender_name)))))).trim()
+  const name = text(row?.sender?.displayName, text(row?.author?.displayName, text(row?.author?.display_name, text(row?.authorName, text(row?.author_name, text(row?.senderName, text(row?.sender_name))))))).trim()
 
   return { kind, name }
 }
@@ -109,7 +109,7 @@ function normalizeMessages(response) {
     archived: false,
     messages: rows.flatMap((row, index) => {
       const id = text(row?.id, text(row?.messageId, `relay-message-${index}`)).trim()
-      const body = text(row?.text, text(row?.content))
+      const body = text(row?.body?.text, text(row?.text, text(row?.content)))
 
       if (!id || typeof body !== 'string') {
         return []

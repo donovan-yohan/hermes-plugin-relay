@@ -22,8 +22,8 @@ test('renders safe human, agent, and system attribution without parsing message 
     histories: {
       general: {
         messages: [
-          { author: { displayName: 'Ari', type: 'human' }, id: 'human-1', text: '@agent is ordinary message content' },
-          { author_type: 'agent', id: 'agent-1', text: 'Automated reply' },
+          { body: { format: 'markdown', text: '@agent is ordinary message content' }, id: 'human-1', sender: { displayName: 'Ari', kind: 'human' } },
+          { body: { format: 'markdown', text: 'Automated reply' }, id: 'agent-1', sender: { displayName: 'Codex', kind: 'agent' } },
           { id: 'system-1', role: 'system', text: 'Channel opened' }
         ]
       }

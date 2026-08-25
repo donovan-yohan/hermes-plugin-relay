@@ -68,14 +68,14 @@ function component(tag, extra = {}) {
   return props => jsx(tag, { ...extra, ...props })
 }
 
-function createSdk() {
+function createSdk(host) {
   return {
     Button: component('button'),
     EmptyState: props => jsx('empty-state', props),
     ErrorState: props => jsx('error-state', props),
+    host,
     Loader: component('loader', { role: 'progressbar' }),
     ROUTES_AREA: 'routes',
-    SIDEBAR_NAV_AREA: 'sidebar.nav',
     StatusDot: props => jsx('status-dot', props),
     Textarea: component('textarea'),
     cn: (...classes) => classes.flat().filter(Boolean).join(' ')
@@ -206,16 +206,23 @@ export async function loadRelay({
   post,
   rest,
   status = { status: 'ready' },
-  storedSelection = ''
+  storedSelection = '',
+  workspaceSupported = true
 } = {}) {
   const calls = []
   const registrations = []
   const socketHandlers = []
   const storage = { get: [], set: [] }
   const timers = new Map()
+  const navigations = []
+  const paneListeners = new Set()
+  const pluginDisposers = []
+  const visibilityRequests = []
+  const workspaceCloses = []
+  const workspaceOpenings = []
+  let paneVisible = false
   let timerId = 0
   const nonce = `relay-${sequence++}`
-
   const setIntervalStub = (callback, delay) => {
     const id = ++timerId
 
@@ -223,10 +230,42 @@ export async function loadRelay({
     return id
   }
   const clearIntervalStub = id => timers.delete(id)
+  const visibility = {
+    get: () => paneVisible,
+    listen: callback => {
+      paneListeners.add(callback)
+      return () => paneListeners.delete(callback)
+    }
+  }
+  const host = {
+    navigate: path => navigations.push(path),
+    openWorkspace: (id, options) => {
+      const opening = { closed: false, id, options }
+
+      workspaceOpenings.push(opening)
+      return () => {
+        if (opening.closed) {
+          return
+        }
+
+        opening.closed = true
+        workspaceCloses.push(id)
+        options.onClose?.()
+      }
+    },
+    paneVisibility: id => {
+      visibilityRequests.push(id)
+      return visibility
+    }
+  }
+
+  if (!workspaceSupported) {
+    delete host.openWorkspace
+  }
 
   const renderer = createRenderer
   globalThis.__RELAY_DESKTOP_TEST__ = globalThis.__RELAY_DESKTOP_TEST__ ?? {}
-  globalThis.__RELAY_DESKTOP_TEST__[nonce] = { sdk: createSdk(), timers: { clearIntervalStub, setIntervalStub } }
+  globalThis.__RELAY_DESKTOP_TEST__[nonce] = { sdk: createSdk(host), timers: { clearIntervalStub, setIntervalStub } }
 
   assert.match(SOURCE, SDK_IMPORT, 'plugin imports the SDK directly')
   assert.match(SOURCE, REACT_IMPORT, 'plugin imports React hooks directly')
@@ -234,7 +273,7 @@ export async function loadRelay({
 
   const prelude = `const __relay = globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}]\n`
   let code = SOURCE
-    .replace(SDK_IMPORT, `${prelude}const { Button, EmptyState, ErrorState, Loader, ROUTES_AREA, SIDEBAR_NAV_AREA, StatusDot, Textarea, cn } = __relay.sdk\n`)
+    .replace(SDK_IMPORT, `${prelude}const { Button, EmptyState, ErrorState, host, Loader, ROUTES_AREA, StatusDot, Textarea, cn } = __relay.sdk\n`)
     .replace(REACT_IMPORT, `const { useCallback, useEffect, useRef, useState } = globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}].hooks\n`)
     .replace(JSX_IMPORT, `const { jsx, jsxs } = globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}].jsxRuntime\n`)
     .replace(/\bsetInterval\(/g, `globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}].timers.setIntervalStub(`)
@@ -253,6 +292,7 @@ export async function loadRelay({
   const plugin = module.default
 
   const ctx = {
+    onDispose: dispose => pluginDisposers.push(dispose),
     registerMany: contributions => {
       registrations.push(...contributions)
       return () => undefined
@@ -279,6 +319,44 @@ export async function loadRelay({
       }
       if (path.startsWith('/channels/') && path.endsWith('/messages') && options.method === 'POST') {
         return post ? post(options.body, path, calls) : { ok: true }
+      }
+      if (path === '/harnesses') {
+        return { harnesses: [
+          { provider: 'claude', sessionCount: 1, status: 'installed', version: '2.1.0' },
+          { provider: 'codex', sessionCount: 1, status: 'installed' },
+          { provider: 'hermes', sessionCount: 0, status: 'unsupported' },
+          { provider: 'opencode', sessionCount: 0, status: 'unavailable' },
+          { provider: 'pi', sessionCount: 0, status: 'unsupported' },
+          { provider: 'prime-agent', sessionCount: 0, status: 'unsupported' }
+        ] }
+      }
+      const harnessSession = path.match(/^\/harnesses\/([a-z-]+)\/sessions\/([^/]+)$/)
+      if (harnessSession) {
+        return {
+          snapshot: {
+            capturedAt: '2026-08-25T01:00:00.000Z',
+            eventTypes: ['user-message', 'assistant-message'],
+            id: decodeURIComponent(harnessSession[2]),
+            lineCount: 12,
+            byteCount: 2048,
+            preview: `snapshot for ${decodeURIComponent(harnessSession[2])}`,
+            provider: harnessSession[1],
+            redacted: true
+          }
+        }
+      }
+      const harnessList = path.match(/^\/harnesses\/([a-z-]+)\/sessions$/)
+      if (harnessList) {
+        return { sessions: [{
+          canWatch: false,
+          cwd: '/repo',
+          id: `${harnessList[1]}-1`,
+          preview: 'latest activity',
+          provider: harnessList[1],
+          redacted: true,
+          timestamp: '2026-08-24T09:00:00.000Z',
+          title: `Recent ${harnessList[1]} work`
+        }] }
       }
 
       throw new Error(`unexpected scoped REST path ${path}`)
@@ -337,11 +415,23 @@ export async function loadRelay({
         entry.onMessage(payload)
       }
     },
+    disposePlugin: () => {
+      for (const dispose of pluginDisposers.splice(0)) {
+        dispose()
+      }
+    },
     histories: () => calls.filter(call => call.path.includes('/messages?limit=50')),
     mount,
+    navigations,
     plugin,
     posts: () => calls.filter(call => call.options.method === 'POST' && call.path.includes('/messages')),
     registrations,
+    setPaneVisible: visible => {
+      paneVisible = visible
+      for (const listener of [...paneListeners]) {
+        listener(visible)
+      }
+    },
     socketHandlers,
     storage,
     tickPoll: () => {
@@ -349,6 +439,9 @@ export async function loadRelay({
         timer.callback()
       }
     },
-    timers
+    timers,
+    visibilityRequests,
+    workspaceCloses,
+    workspaceOpenings
   }
 }

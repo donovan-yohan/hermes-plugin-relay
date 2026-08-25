@@ -5,9 +5,25 @@ The Desktop renderer talks only to the plugin-local REST namespace:
 from this standalone plugin; the renderer cannot address Relay directly or read
 plugin process environment variables.
 
-`desktop/plugin.js` contributes the full `/relay` route and sidebar entry. It
-renders connection state, channel inventory, the selected transcript, and a
-message composer without touching Hermes sessions or composer middleware.
+`desktop/plugin.js` contributes a top-level **Relay** pane center-docked into
+the Sessions zone, producing the same `SESSIONS | BOTS | RELAY` tab strip used
+by Bot Mode. Selecting it opens a plugin-owned main-area workspace; switching
+away tears that workspace down instead of leaving Relay stapled into ordinary
+session navigation. The full `/relay` route remains as a deep-link and
+older-Desktop fallback, but there is no `sidebar.nav` list row.
+
+The workspace renders connection state, channel inventory, the selected
+transcript, and a message composer without touching Hermes sessions or composer
+middleware.
+
+A second sidebar surface, **Harnesses**, is a read-only inspector over the
+native coding-agent sessions Relay already tracks (Claude Code, Codex, Pi,
+Prime Agent, plus Hermes/OpenCode rows when Relay reports them). Harnesses
+render as collapsible groups with an install-status dot, session count, and
+optional version; expanding an installed group loads that provider's native
+session summaries (newest first), and selecting one shows a bounded, redacted
+snapshot. This surface never renders a composer: the hub contract for native
+sessions is strictly read-only observation.
 
 This backend deliberately exposes no `/events` endpoint. Desktop refreshes its
 visible page every three seconds instead of pretending that a local poll is a
@@ -20,6 +36,24 @@ stream.
 - `GET /channels`
 - `GET /channels/:id/messages?limit=50` (1–50 only)
 - `POST /channels/:id/messages`
+
+### Native harness-session endpoints
+
+These routes ride a separate scoped actor-token lane and return only projected,
+renderer-safe fields:
+
+- `GET /harnesses` → per-provider `{ provider, status, sessionCount, version? }`
+- `GET /harnesses/:provider/sessions` → bounded summaries (`id`, `title`,
+  `cwd`, `preview`, `updatedAt`, `canWatch`, `redacted`), newest first.
+  `cwd` is the harness's own recorded working directory, surfaced for
+  orientation only; it is not used by this backend for any access decision.
+- `GET /harnesses/:provider/sessions/:nativeId` → one bounded snapshot
+  (`capturedAt`, `preview`, `lineCount`, `byteCount`, `eventTypes`, `redacted`)
+
+Unknown providers, oversized ids, and malformed upstream payloads fail closed.
+Native transcript source paths, hashes, and provider-internal metadata are
+stripped before anything reaches the renderer. There is no write path: the
+plugin cannot create, resume, inject into, or delete any harness session.
 
 Message posts accept exactly:
 
@@ -54,6 +88,16 @@ one-time `RELAY_IDE_OPERATOR_GRANT` using fixed generic client metadata and
 only `context:read` / `context:write`. Every supplied or returned credential is
 held only in this Python process and is locally bounded to 15 minutes. It is
 cleared on local expiry and any Relay 401/403.
+
+The harness-session surface uses a second, independent credential family.
+`RELAY_IDE_ACTOR_TOKEN` supplies an existing Relay scoped actor token
+(`relay-sac-v1…`) with `session:read`; otherwise `RELAY_IDE_ACTOR_GRANT`
+supplies a one-time handshake grant that is redeemed (once) for
+audience `relay:cli-gateway:v1`, capability `session:read`, and the standard
+read task-ref scope. The two lanes never share tokens: channels stay on the
+operator-client credential and native sessions on the actor credential, so a
+compromise or failure of one cannot widen into the other. Actor tokens obey the
+same in-process-only, 15-minute-ceiling, cleared-on-401/403 rules.
 
 Neither token nor grant is ever returned to Desktop JavaScript, included in a
 URL, written to config/files, placed in test fixtures, or logged by this

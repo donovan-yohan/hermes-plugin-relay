@@ -60,6 +60,7 @@ _proxy_mod = importlib.import_module(f"{_PKG}.relay_proxy")
 
 RelayAuthRequiredError = _proxy_mod.RelayAuthRequiredError
 RelayConfigurationError = _proxy_mod.RelayConfigurationError
+ConnectionStatus = _proxy_mod.ConnectionStatus
 RelayMalformedResponseError = _proxy_mod.RelayMalformedResponseError
 RelayProxyError = _proxy_mod.RelayProxyError
 RelayResponseTooLargeError = _proxy_mod.RelayResponseTooLargeError
@@ -69,10 +70,16 @@ MAX_CHANNEL_ID_BYTES = _proxy_mod.MAX_CHANNEL_ID_BYTES
 MAX_CLIENT_MESSAGE_ID_BYTES = _proxy_mod.MAX_CLIENT_MESSAGE_ID_BYTES
 MAX_HISTORY_LIMIT = _proxy_mod.MAX_HISTORY_LIMIT
 MAX_MESSAGE_TEXT_BYTES = _proxy_mod.MAX_MESSAGE_TEXT_BYTES
+MAX_SESSION_ID_BYTES = _proxy_mod.MAX_SESSION_ID_BYTES
+NATIVE_PROVIDERS = _proxy_mod.NATIVE_PROVIDERS
 
 
 def _proxy() -> Any:
     return _proxy_mod.get_relay_proxy()
+
+
+def _actor_lane() -> Any:
+    return _proxy_mod.get_actor_lane()
 
 
 def _error(status_code: int, code: str, message: str, *, retryable: bool = False) -> JSONResponse:
@@ -194,6 +201,18 @@ def _post_body(value: Mapping[str, Any]) -> dict[str, str]:
     return {"text": text, "format": message_format, "clientMessageId": client_message_id}
 
 
+def _provider(value: str) -> str:
+    if value not in NATIVE_PROVIDERS:
+        raise RequestValidationError(400, "invalid_provider", "Unknown harness provider")
+    return value
+
+
+def _native_session_id(value: str) -> str:
+    if not value or len(value.encode("utf-8")) > MAX_SESSION_ID_BYTES:
+        raise RequestValidationError(400, "invalid_session", "Native session id is invalid")
+    return value
+
+
 @router.get("/connection/status")
 async def connection_status() -> Any:
     return (await run_in_threadpool(_proxy().status)).to_wire()
@@ -206,7 +225,14 @@ async def connection_authorize(request: Request) -> Any:
         # renderer cannot smuggle client metadata, scope, or a grant through it.
         if await _read_request_body(request):
             raise RequestValidationError(400, "invalid_body", "Authorization does not accept a body")
-        return (await run_in_threadpool(_proxy().authorize)).to_wire()
+        channel_status = await run_in_threadpool(_proxy().authorize)
+        harness_status = await run_in_threadpool(_actor_lane().authorize)
+        # Report the single worst lane honestly, with that lane's own message:
+        # error > offline > auth_required > ready. Collapsing distinct states
+        # would tell the renderer to re-authorize during a plain outage.
+        ranking = {"error": 3, "offline": 2, "auth_required": 1, "ready": 0}
+        worst = max((channel_status, harness_status), key=lambda s: ranking[s.status])
+        return worst.to_wire()
     except RequestValidationError as error:
         return _error(error.status_code, error.code, error.message)
     except RelayProxyError as error:
@@ -236,6 +262,43 @@ async def post_channel_message(channel_id: str, request: Request) -> Any:
     try:
         body = _post_body(await _read_json_object(request))
         return await run_in_threadpool(_proxy().post, _channel_id(channel_id), body)
+    except RequestValidationError as error:
+        return _error(error.status_code, error.code, error.message)
+    except RelayProxyError as error:
+        return _relay_error(error)
+
+
+@router.get("/harnesses")
+async def list_harnesses() -> Any:
+    try:
+        rows = await run_in_threadpool(_actor_lane().harnesses)
+        return {"harnesses": rows}
+    except RelayProxyError as error:
+        return _relay_error(error)
+
+
+@router.get("/harnesses/{provider}/sessions")
+async def list_harness_sessions(provider: str) -> Any:
+    try:
+        rows = await run_in_threadpool(
+            _actor_lane().harness_sessions, _provider(provider)
+        )
+        return {"sessions": rows}
+    except RequestValidationError as error:
+        return _error(error.status_code, error.code, error.message)
+    except RelayProxyError as error:
+        return _relay_error(error)
+
+
+@router.get("/harnesses/{provider}/sessions/{native_id}")
+async def get_harness_session(provider: str, native_id: str) -> Any:
+    try:
+        snapshot = await run_in_threadpool(
+            _actor_lane().harness_session,
+            _provider(provider),
+            _native_session_id(native_id),
+        )
+        return {"snapshot": snapshot}
     except RequestValidationError as error:
         return _error(error.status_code, error.code, error.message)
     except RelayProxyError as error:

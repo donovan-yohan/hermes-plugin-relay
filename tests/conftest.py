@@ -46,8 +46,13 @@ class RecordingTransport:
 
 @pytest.fixture(autouse=True)
 def reset_proxy_singleton():
-    from hermes_plugin_relay.relay_proxy import reset_relay_proxy_for_tests
+    from hermes_plugin_relay.relay_proxy import (
+        reset_actor_lane_for_tests,
+        reset_relay_proxy_for_tests,
+    )
 
     reset_relay_proxy_for_tests()
+    reset_actor_lane_for_tests()
     yield
     reset_relay_proxy_for_tests()
+    reset_actor_lane_for_tests()

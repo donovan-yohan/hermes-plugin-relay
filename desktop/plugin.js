@@ -25,6 +25,20 @@ const HISTORY_LIMIT = 50
 const CONNECTION_STATES = new Set(['ready', 'offline', 'auth_required', 'error'])
 const NON_RETRYABLE_STATUS_CODES = new Set([400, 404, 409, 413])
 const RELAY_WORKSPACE_ID = `${PLUGIN_ID}:home`
+const HARNESS_PROVIDERS = ['claude', 'codex', 'hermes', 'opencode', 'pi', 'prime-agent']
+const HARNESS_META = {
+  claude: { label: 'Claude Code' },
+  codex: { label: 'Codex' },
+  hermes: { label: 'Hermes' },
+  opencode: { label: 'OpenCode' },
+  pi: { label: 'Pi' },
+  'prime-agent': { label: 'Prime Agent' }
+}
+const STATUS_TONES = {
+  installed: 'good',
+  unavailable: 'bad',
+  unsupported: 'idle'
+}
 
 let pluginContext = null
 let relayWorkspaceClose = null
@@ -166,6 +180,121 @@ function newClientMessageId() {
 
 function emptyHistory() {
   return { archived: false, error: '', loading: false, messages: [] }
+}
+
+function normalizeHarnesses(response) {
+  const rows = Array.isArray(response) ? response : response?.harnesses
+
+  if (!Array.isArray(rows)) {
+    throw new Error('Relay returned an invalid harness report.')
+  }
+
+  return rows.flatMap(row => {
+    const provider = text(row?.provider).trim()
+    const status = text(row?.status).trim()
+
+    if (!provider || !HARNESS_PROVIDERS.includes(provider) || !STATUS_TONES[status]) {
+      return []
+    }
+
+    return [{
+      label: HARNESS_META[provider].label,
+      provider,
+      sessionCount: Number.isInteger(row?.sessionCount) && row.sessionCount >= 0 ? row.sessionCount : 0,
+      status,
+      version: text(row?.version).trim()
+    }]
+  })
+}
+
+function normalizeHarnessSessions(response, provider) {
+  const rows = Array.isArray(response) ? response : response?.sessions
+
+  if (!Array.isArray(rows)) {
+    throw new Error(`Relay returned an invalid session list for ${HARNESS_META[provider]?.label || provider}.`)
+  }
+
+  return rows.flatMap((row, index) => {
+    const id = text(row?.id).trim()
+
+    if (!id) {
+      return []
+    }
+
+    return [{
+      canWatch: row?.canWatch === true,
+      cwd: text(row?.cwd).trim(),
+      id,
+      preview: text(row?.preview),
+      provider,
+      redacted: row?.redacted === true,
+      timestamp: text(row?.updatedAt),
+      title: text(row?.title).trim() || `Session ${index + 1}`
+    }]
+  })
+}
+
+function normalizeHarnessSnapshot(response, fallbackProvider, fallbackId) {
+  const snapshot = response?.snapshot
+
+  if (!snapshot || typeof snapshot !== 'object') {
+    throw new Error('Relay returned an invalid session snapshot.')
+  }
+
+  const eventTypes = Array.isArray(snapshot.eventTypes)
+    ? snapshot.eventTypes.filter(kind => typeof kind === 'string')
+    : []
+
+  return {
+    capturedAt: text(snapshot.capturedAt),
+    eventTypes,
+    id: text(snapshot.id).trim() || fallbackId,
+    lineCount: Number.isInteger(snapshot.lineCount) ? snapshot.lineCount : null,
+    byteCount: Number.isInteger(snapshot.byteCount) ? snapshot.byteCount : null,
+    preview: text(snapshot.preview),
+    provider: text(snapshot.provider).trim() || fallbackProvider,
+    redacted: snapshot.redacted === true
+  }
+}
+
+function formatStamp(stamp) {
+  if (!stamp) {
+    return ''
+  }
+
+  const parsed = new Date(stamp)
+
+  if (Number.isNaN(parsed.getTime())) {
+    return stamp
+  }
+
+  return parsed.toLocaleString()
+}
+
+function relativeTime(stamp) {
+  if (!stamp) {
+    return 'unknown time'
+  }
+
+  const parsed = new Date(stamp)
+
+  if (Number.isNaN(parsed.getTime())) {
+    return stamp
+  }
+
+  const seconds = Math.round((Date.now() - parsed.getTime()) / 1000)
+
+  if (seconds < 45) {
+    return 'just now'
+  }
+  if (seconds < 3600) {
+    return `${Math.round(seconds / 60)}m ago`
+  }
+  if (seconds < 86400) {
+    return `${Math.round(seconds / 3600)}h ago`
+  }
+
+  return `${Math.round(seconds / 86400)}d ago`
 }
 
 function safeStorageGet(ctx) {
@@ -427,6 +556,179 @@ function Transcript({ channel, entry, onRetry }) {
   })
 }
 
+function HarnessGroupHeader({ expanded, harness, onToggle }) {
+  const countLabel = harness.status === 'installed'
+    ? `${harness.sessionCount} session${harness.sessionCount === 1 ? '' : 's'}`
+    : 'not available'
+
+  return jsxs('button', {
+    'aria-expanded': expanded,
+    className: cn(
+      'flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-(--chrome-action-hover)',
+      expanded && 'bg-(--chrome-action-hover)'
+    ),
+    'data-harness': harness.provider,
+    'data-harness-status': harness.status,
+    onClick: onToggle,
+    type: 'button',
+    children: [
+      jsx('span', {
+        'aria-hidden': true,
+        className: cn(
+          'text-xs text-(--ui-text-tertiary) transition-transform',
+          expanded && 'rotate-90'
+        ),
+        children: '▶'
+      }),
+      jsx(StatusDot, { tone: STATUS_TONES[harness.status] }),
+      jsxs('span', {
+        className: 'min-w-0 flex-1',
+        children: [
+          jsxs('span', { className: 'flex items-baseline justify-between gap-2', children: [
+            jsx('span', { className: 'truncate font-medium text-(--ui-text-primary)', children: harness.label }),
+            jsx('span', { className: 'shrink-0 text-xs tabular-nums text-(--ui-text-tertiary)', children: countLabel })
+          ] }),
+          harness.version
+            ? jsx('span', { className: 'block truncate text-xs text-(--ui-text-quaternary)', children: `v${harness.version}` })
+            : null
+        ]
+      })
+    ]
+  })
+}
+
+function HarnessSessionRow({ onSelect, selected, session }) {
+  return jsxs('button', {
+    'aria-current': selected ? 'true' : undefined,
+    className: cn(
+      'ml-6 flex w-[calc(100%-1.5rem)] flex-col gap-0.5 border-l border-(--ui-stroke-tertiary) py-1.5 pl-3 pr-2 text-left transition-colors hover:bg-(--chrome-action-hover)',
+      selected ? 'bg-(--chrome-action-hover)' : 'border-transparent'
+    ),
+    'data-session-id': session.id,
+    onClick: onSelect,
+    type: 'button',
+    children: [
+      jsxs('span', { className: 'flex items-baseline justify-between gap-2', children: [
+        jsx('span', { className: 'truncate text-sm text-(--ui-text-primary)', children: session.title }),
+        jsx('span', { className: 'shrink-0 text-xs text-(--ui-text-tertiary)', children: relativeTime(session.timestamp) })
+      ] }),
+      session.cwd
+        ? jsx('span', { className: 'truncate text-xs text-(--ui-text-tertiary)', children: session.cwd })
+        : null,
+      session.preview
+        ? jsx('span', { className: 'truncate text-xs text-(--ui-text-quaternary)', children: `${session.redacted ? '[redacted] ' : ''}${session.preview}` })
+        : null
+    ]
+  }, session.id)
+}
+
+function HarnessList({
+  expandedProviders,
+  harnesses,
+  onRetry,
+  onSessionSelect,
+  onToggle,
+  selectedSessionId,
+  sessionCache,
+  sessionsLoading
+}) {
+  if (harnesses.length === 0) {
+    return jsx(EmptyState, {
+      description: 'Relay reported no supported harnesses on this machine yet.',
+      title: 'No harnesses detected'
+    })
+  }
+
+  return jsxs('div', {
+    className: 'flex min-h-0 flex-1 flex-col overflow-y-auto pb-2',
+    role: 'group',
+    'aria-label': 'Harnesses',
+    children: [
+      sessionsLoading.error
+        ? jsxs('div', {
+            className: 'flex items-center justify-between gap-2 px-4 py-1 text-xs text-(--ui-text-tertiary)',
+            children: [jsx('span', { className: 'truncate', children: sessionsLoading.error }), jsx(Button, { onClick: () => void onRetry(), size: 'xs', type: 'button', variant: 'text', children: 'Retry' })]
+          })
+        : null,
+      ...harnesses.map(harness => {
+        const expanded = expandedProviders.includes(harness.provider)
+        const entry = sessionCache[harness.provider]
+
+        return jsxs('div', { key: harness.provider, children: [
+          jsx(HarnessGroupHeader, { expanded, harness, onToggle: () => onToggle(harness.provider) }),
+          expanded && harness.status === 'installed'
+            ? !entry || entry.loading
+              ? jsx('div', { className: 'flex justify-center py-3', children: jsx(Loader, {}) })
+              : entry.error
+                ? jsx('div', { className: 'px-4 py-2 pl-9 text-xs text-(--ui-text-tertiary)', children: entry.error })
+                : entry.sessions.length === 0
+                  ? jsx('div', { className: 'px-4 py-2 pl-9 text-xs text-(--ui-text-tertiary)', children: 'No native sessions found for this harness.' })
+                  : entry.sessions.map(session =>
+                      jsx(HarnessSessionRow, {
+                        onSelect: () => onSessionSelect(harness.provider, session.id),
+                        selected: selectedSessionId === session.id,
+                        session
+                      }, session.id))
+            : null
+        ] }, harness.provider)
+      })
+    ]
+  })
+}
+
+function SessionDetail({ detail }) {
+  if (!detail) {
+    return jsx(EmptyState, {
+      description: 'Expand a harness and pick one of its native sessions to inspect it.',
+      title: 'Select a session'
+    })
+  }
+
+  if (detail.loading) {
+    return jsx('div', { className: 'flex flex-1 items-center justify-center', children: jsx(Loader, {}) })
+  }
+
+  if (detail.error) {
+    return jsx(ErrorState, {
+      action: null,
+      description: detail.error,
+      title: 'Session could not be loaded'
+    })
+  }
+
+  const snapshot = detail.snapshot
+
+  return jsxs('div', {
+    className: 'min-h-0 flex-1 overflow-y-auto',
+    children: [
+      jsxs('header', {
+        className: 'flex items-center justify-between gap-3 border-b border-(--ui-stroke-tertiary) px-4 py-2 text-xs text-(--ui-text-tertiary)',
+        children: [
+          jsxs('span', { className: 'truncate', children: [
+            HARNESS_META[snapshot.provider]?.label || snapshot.provider,
+            ' · ',
+            snapshot.id
+          ] }),
+          snapshot.capturedAt ? jsx('time', { children: formatStamp(snapshot.capturedAt) }) : null
+        ]
+      }),
+      jsxs('div', {
+        className: 'flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-(--ui-stroke-tertiary) px-4 py-2 text-xs text-(--ui-text-tertiary)',
+        children: [
+          snapshot.lineCount != null ? jsx('span', { children: `${snapshot.lineCount} records` }) : null,
+          snapshot.byteCount != null ? jsx('span', { children: `${(snapshot.byteCount / 1024).toFixed(1)} KiB` }) : null,
+          snapshot.eventTypes.length ? jsx('span', { children: snapshot.eventTypes.join(', ') }) : null,
+          snapshot.redacted ? jsx('span', { 'data-redacted': 'true', children: 'redacted preview' }) : null
+        ]
+      }),
+      jsxs('p', {
+        className: 'whitespace-pre-wrap break-words px-4 py-3 text-sm text-(--ui-text-primary)',
+        children: snapshot.preview || 'This transcript has no redactable preview text yet.'
+      })
+    ]
+  })
+}
+
 function RelayPage() {
   const ctx = pluginContext
   const [connection, setConnection] = useState({ message: '', status: 'loading' })
@@ -438,6 +740,15 @@ function RelayPage() {
   const [pending, setPending] = useState(false)
   const [sending, setSending] = useState(false)
   const [retry, setRetry] = useState(null)
+  // Harness view state. The channels surface keeps its own selection; the
+  // harness view is a read-only inspector over native provider sessions.
+  const [surface, setSurface] = useState('channels')
+  const [harnesses, setHarnesses] = useState([])
+  const [harnessError, setHarnessError] = useState('')
+  const [expandedProviders, setExpandedProviders] = useState([])
+  const [sessionCache, setSessionCache] = useState({})
+  const [sessionSelection, setSessionSelection] = useState({ id: '', provider: '' })
+  const [sessionDetail, setSessionDetail] = useState(null)
 
   const connectionRef = useRef(connection)
   const selectedRef = useRef(selectedChannelId)
@@ -445,6 +756,8 @@ function RelayPage() {
   const historyGeneration = useRef(0)
   const storedSelectionRead = useRef(false)
   const retryRef = useRef(null)
+  const sessionGeneration = useRef(0)
+  const detailGeneration = useRef(0)
 
   connectionRef.current = connection
   selectedRef.current = selectedChannelId
@@ -640,9 +953,116 @@ function RelayPage() {
     }
   }, [ctx, draft, loadHistory, noteAuthRequired])
 
+  const loadHarnesses = useCallback(async () => {
+    if (typeof ctx?.rest !== 'function') {
+      setHarnessError('Relay’s local API bridge is unavailable.')
+
+      return
+    }
+
+    try {
+      const nextHarnesses = normalizeHarnesses(await ctx.rest('/harnesses'))
+
+      setHarnesses(nextHarnesses)
+      setHarnessError('')
+    } catch (error) {
+      if (!noteAuthRequired(error)) {
+        setHarnessError(errorMessage(error, 'Relay could not list harness sessions.'))
+      }
+    }
+  }, [ctx, noteAuthRequired])
+
+  const toggleProvider = useCallback(provider => {
+    setExpandedProviders(current =>
+      current.includes(provider)
+        ? current.filter(item => item !== provider)
+        : [...current, provider]
+    )
+
+    if (expandedProviders.includes(provider)) {
+      return
+    }
+
+    // First expansion loads (or refreshes once per mount) that harness's rows.
+    const generation = ++sessionGeneration.current
+
+    setSessionCache(cache => ({
+      ...cache,
+      [provider]: cache[provider] ? { ...cache[provider], loading: true } : { error: '', loading: true, sessions: [] }
+    }))
+
+    void (async () => {
+      try {
+        const sessions = normalizeHarnessSessions(await ctx.rest(`/harnesses/${encodeURIComponent(provider)}/sessions`), provider)
+
+        if (generation !== sessionGeneration.current) {
+          return
+        }
+
+        setSessionCache(cache => ({ ...cache, [provider]: { error: '', loading: false, sessions } }))
+      } catch (error) {
+        if (generation !== sessionGeneration.current) {
+          return
+        }
+
+        setSessionCache(cache => ({
+          ...cache,
+          [provider]: {
+            error: isAuthError(error) ? 'Relay authorization is required for harness sessions.' : errorMessage(error, 'Relay could not list this harness’s sessions.'),
+            loading: false,
+            sessions: []
+          }
+        }))
+      }
+    })()
+  }, [ctx, expandedProviders])
+
+  const chooseSession = useCallback(async (provider, sessionId) => {
+    if (!provider || !sessionId || typeof ctx?.rest !== 'function') {
+      return
+    }
+
+    const generation = ++detailGeneration.current
+
+    setSessionSelection({ id: sessionId, provider })
+    setSessionDetail({ loading: true, snapshot: null })
+
+    try {
+      const snapshot = normalizeHarnessSnapshot(
+        await ctx.rest(`/harnesses/${encodeURIComponent(provider)}/sessions/${encodeURIComponent(sessionId)}`),
+        provider,
+        sessionId
+      )
+
+      if (generation !== detailGeneration.current) {
+        return
+      }
+
+      setSessionDetail({ loading: false, snapshot })
+    } catch (error) {
+      if (generation !== detailGeneration.current) {
+        return
+      }
+
+      setSessionDetail({
+        loading: false,
+        snapshot: null,
+        error: isAuthError(error) ? 'Relay authorization is required for this session.' : errorMessage(error, 'Relay could not read this session snapshot.')
+      })
+    }
+  }, [ctx])
+
   useEffect(() => {
     void refreshPage()
   }, [refreshPage])
+
+  // Harness rows load when the operator switches to the harness surface, and
+  // refresh on each switch so a freshly started harness shows up.
+  useEffect(() => {
+    if (surface === 'harnesses' && connection.status === 'ready') {
+      void loadHarnesses()
+    }
+  }, [connection.status, loadHarnesses, surface])
 
   useEffect(() => {
     if (connection.status !== 'ready' || !selectedChannelId) {
@@ -679,8 +1099,54 @@ function RelayPage() {
             'aria-label': 'Relay channels',
             className: 'flex min-h-36 shrink-0 flex-col border-b border-(--ui-stroke-tertiary) md:w-72 md:border-r md:border-b-0',
             children: [
-              jsx('div', { className: 'px-4 pt-4 text-xs font-medium uppercase tracking-wide text-(--ui-text-tertiary)', children: 'Channels' }),
-              jsx(ChannelList, { channels, error: channelError, loading: pending && channels.length === 0, onRetry: refreshPage, onSelect: chooseChannel, selectedChannelId })
+              jsxs('div', {
+                'aria-label': 'Relay surfaces',
+                className: 'flex gap-1 px-3 pt-3',
+                role: 'tablist',
+                children: [
+                  jsx(Button, {
+                    'aria-selected': surface === 'channels',
+                    'data-surface': 'channels',
+                    onClick: () => setSurface('channels'),
+                    role: 'tab',
+                    size: 'sm',
+                    type: 'button',
+                    variant: surface === 'channels' ? 'secondary' : 'ghost',
+                    children: 'Channels'
+                  }),
+                  jsx(Button, {
+                    'aria-selected': surface === 'harnesses',
+                    'data-surface': 'harnesses',
+                    onClick: () => setSurface('harnesses'),
+                    role: 'tab',
+                    size: 'sm',
+                    type: 'button',
+                    variant: surface === 'harnesses' ? 'secondary' : 'ghost',
+                    children: 'Harnesses'
+                  })
+                ]
+              }),
+              jsx('div', { className: 'px-4 pt-4 text-xs font-medium uppercase tracking-wide text-(--ui-text-tertiary)', children: surface === 'channels' ? 'Channels' : 'Harnesses' }),
+              surface === 'channels'
+                ? jsx(ChannelList, { channels, error: channelError, loading: pending && channels.length === 0, onRetry: refreshPage, onSelect: chooseChannel, selectedChannelId })
+                : harnessError && harnesses.length === 0
+                  ? jsxs('div', {
+                      className: 'flex flex-1 flex-col items-center justify-center gap-2 px-4 text-sm text-(--ui-text-secondary)',
+                      children: [
+                        jsx('span', { className: 'text-center', children: harnessError }),
+                        jsx(Button, { onClick: () => void loadHarnesses(), size: 'sm', type: 'button', variant: 'secondary', children: 'Retry harnesses' })
+                      ]
+                    })
+                  : jsx(HarnessList, {
+                      expandedProviders,
+                      harnesses,
+                      onRetry: loadHarnesses,
+                      onSessionSelect: (provider, sessionId) => void chooseSession(provider, sessionId),
+                      onToggle: toggleProvider,
+                      selectedSessionId: sessionSelection.id,
+                      sessionCache,
+                      sessionsLoading: { error: '' }
+                    })
             ]
           }),
           jsxs('section', {
@@ -692,13 +1158,20 @@ function RelayPage() {
                 children: [
                   jsxs('div', {
                     className: 'min-w-0',
-                    children: [jsx('h1', { className: 'truncate text-sm font-medium', children: selectedChannel?.name || 'Relay' }), selectedChannel?.summary ? jsx('p', { className: 'truncate text-xs text-(--ui-text-tertiary)', children: selectedChannel.summary }) : null]
+                    children: [jsx('h1', { className: 'truncate text-sm font-medium', children: surface === 'harnesses'
+                      ? (sessionDetail?.snapshot
+                          ? `${HARNESS_META[sessionDetail.snapshot.provider]?.label || sessionDetail.snapshot.provider} session`
+                          : 'Harness sessions')
+                      : (selectedChannel?.name || 'Relay') }), surface === 'channels' && selectedChannel?.summary ? jsx('p', { className: 'truncate text-xs text-(--ui-text-tertiary)', children: selectedChannel.summary }) : null]
                   }),
                   jsx(Button, { disabled: pending, onClick: () => void refreshPage(), size: 'sm', type: 'button', variant: 'ghost', children: 'Refresh' })
                 ]
               }),
-              jsx(Transcript, { channel: selectedChannel, entry: transcript, onRetry: refreshLatest }),
-              jsxs('form', {
+              surface === 'channels'
+                ? jsx(Transcript, { channel: selectedChannel, entry: transcript, onRetry: refreshLatest })
+                : jsx(SessionDetail, { detail: sessionDetail }),
+              surface === 'channels'
+                ? jsxs('form', {
                 className: 'shrink-0 border-t border-(--ui-stroke-tertiary) p-4',
                 onSubmit: event => {
                   event.preventDefault()
@@ -741,6 +1214,7 @@ function RelayPage() {
                   })
                 ]
               })
+                : null
             ]
           })
         ]

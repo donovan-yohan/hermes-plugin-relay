@@ -72,6 +72,15 @@ def install_proxy(api_module, handler, *, credential="configured-value", grant=N
     return transport
 
 
+def install_actor_lane(api_module, handler, *, actor_token=None, grant=None):
+    from hermes_plugin_relay.relay_proxy import ActorLaneClient
+
+    transport = RecordingTransport(handler)
+    lane = ActorLaneClient(actor_token=actor_token, grant=grant, transport=transport)
+    api_module._proxy_mod.reset_actor_lane_for_tests(lane)
+    return transport
+
+
 def test_flat_module_loads_the_shared_package_and_manifest_is_backend_only(api_module):
     manifest = json.loads((ROOT / "dashboard" / "manifest.json").read_text(encoding="utf-8"))
     plugin_yaml = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
@@ -201,3 +210,167 @@ def test_request_body_and_history_query_bounds_are_enforced_before_relay(client,
     assert client.get(f"{PREFIX}/channels/topic:one/messages?limit=51").status_code == 400
     assert client.get(f"{PREFIX}/channels/topic:one/messages?limit=50&afterSeq=1").status_code == 400
     assert transport.calls == []
+
+
+def harness_report() -> dict:
+    return {
+        "sessions": [
+            {"provider": "claude", "nativeId": "a1"},
+            {"provider": "codex", "nativeId": "c1"},
+        ],
+        "providers": [
+            {
+                "provider": "claude",
+                "status": "installed",
+                "detectedAt": "2026-08-25T00:00:00.000Z",
+                "stateRoots": ["/home/test/.claude"],
+                "diagnostics": [],
+                "version": "2.1.0",
+            },
+            {
+                "provider": "codex",
+                "status": "installed",
+                "detectedAt": "2026-08-25T00:00:00.000Z",
+                "stateRoots": ["/home/test/.codex"],
+                "diagnostics": [],
+            },
+            {
+                "provider": "pi",
+                "status": "unsupported",
+                "detectedAt": "2026-08-25T00:00:00.000Z",
+                "stateRoots": [],
+                "diagnostics": [],
+            },
+        ],
+    }
+
+
+def harness_session_summaries() -> dict:
+    return {
+        "sessions": [
+            {
+                "provider": "codex",
+                "nativeId": "c2-newer",
+                "sourcePath": "/home/test/.codex/secret-new.jsonl",
+                "cwd": "/repo",
+                "title": "newest",
+                "createdAt": "2026-08-24T00:00:00.000Z",
+                "updatedAt": "2026-08-24T09:00:00.000Z",
+                "lastMessageAt": "2026-08-24T09:00:00.000Z",
+                "preview": {"text": "fresh", "source": "transcript", "redacted": True, "charCount": 5},
+                "metadata": {},
+                "capabilities": {
+                    "canImportTranscript": True,
+                    "canReadProviderState": True,
+                    "canStreamLiveEvents": True,
+                    "readOnly": True,
+                },
+            },
+            {
+                "provider": "codex",
+                "nativeId": "c1-older",
+                "cwd": "/repo",
+                "preview": {"text": "", "source": "none", "redacted": False, "charCount": 0},
+                "capabilities": {
+                    "canImportTranscript": True,
+                    "canReadProviderState": True,
+                    "canStreamLiveEvents": False,
+                    "readOnly": True,
+                },
+            },
+        ]
+    }
+
+
+def test_harness_routes_project_only_safe_rows(client, api_module):
+    def handler(**call):
+        if call["url"].endswith("/sessions/native"):
+            return RelayHttpResponse(200, harness_report())
+        if call["url"].endswith("provider=codex"):
+            return RelayHttpResponse(200, harness_session_summaries())
+        return pytest.fail(f"unexpected relay call {call['url']}")
+
+    transport = install_actor_lane(api_module, handler, actor_token="configured-sac")
+
+    harnesses = client.get(f"{PREFIX}/harnesses")
+    assert harnesses.status_code == 200
+    rows = harnesses.json()["harnesses"]
+    assert rows == [
+        {"provider": "claude", "status": "installed", "sessionCount": 1, "version": "2.1.0"},
+        {"provider": "codex", "status": "installed", "sessionCount": 1},
+        {"provider": "pi", "status": "unsupported", "sessionCount": 0},
+    ]
+
+    sessions = client.get(f"{PREFIX}/harnesses/codex/sessions")
+    assert sessions.status_code == 200
+    body = sessions.json()["sessions"]
+    assert [row["id"] for row in body] == ["c2-newer", "c1-older"]
+    wire = json.dumps(body)
+    for private in ("secret-new", "/home/test", "hashSha256"):
+        assert private not in wire
+    assert body[0]["canWatch"] is True
+    assert body[0]["redacted"] is True
+
+    list_call, scoped_call = transport.calls
+    assert list_call["headers"]["x-relay-cli-command"] == "sessions.native.list"
+    assert scoped_call["url"].endswith("/sessions/native?provider=codex")
+
+
+def test_harness_snapshot_route_is_bounded_and_private_path_free(client, api_module):
+    def handler(**_call):
+        return RelayHttpResponse(
+            200,
+            {
+                "snapshot": {
+                    "ref": {"provider": "claude", "nativeId": "a1", "sourcePath": "/secret/a1.jsonl"},
+                    "capturedAt": "2026-08-25T01:00:00.000Z",
+                    "sourcePath": "/secret/a1.jsonl",
+                    "summary": {
+                        "lineCount": 3,
+                        "byteCount": 512,
+                        "hashSha256": "beef",
+                        "eventTypes": ["user-message"],
+                        "preview": {"text": "hi", "source": "transcript", "redacted": False, "charCount": 2},
+                    },
+                    "redaction": {"rawPayloadStored": False, "strategy": "preview", "classes": []},
+                }
+            },
+        )
+
+    install_actor_lane(api_module, handler, actor_token="t")
+    response = client.get(f"{PREFIX}/harnesses/claude/sessions/a1")
+    assert response.status_code == 200
+    snapshot = response.json()["snapshot"]
+    assert snapshot == {
+        "id": "a1",
+        "provider": "claude",
+        "capturedAt": "2026-08-25T01:00:00.000Z",
+        "preview": "hi",
+        "redacted": False,
+        "lineCount": 3,
+        "byteCount": 512,
+        "eventTypes": ["user-message"],
+    }
+
+
+def test_invalid_provider_paths_fail_closed(client, api_module):
+    install_actor_lane(api_module, lambda **_call: pytest.fail("must not dial"))
+    response = client.get(f"{PREFIX}/harnesses/nope/sessions")
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_provider"
+
+
+def test_oversized_native_ids_reject_before_relay(client, api_module):
+    install_actor_lane(api_module, lambda **_call: pytest.fail("must not dial"))
+    response = client.get(f"{PREFIX}/harnesses/claude/sessions/{'x' * 600}")
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_session"
+
+
+def test_actor_auth_required_maps_to_the_shared_envelope(client, api_module):
+    install_actor_lane(api_module, lambda **_call: pytest.fail("must not dial"))
+    response = client.get(f"{PREFIX}/harnesses")
+    assert response.status_code == 401
+    assert response.json() == {
+        "error": {"code": "auth_required", "message": "Relay authorization is required", "retryable": False}
+    }

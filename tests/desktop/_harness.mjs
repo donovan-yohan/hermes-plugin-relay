@@ -223,7 +223,6 @@ export async function loadRelay({
   let paneVisible = false
   let timerId = 0
   const nonce = `relay-${sequence++}`
-
   const setIntervalStub = (callback, delay) => {
     const id = ++timerId
 
@@ -320,6 +319,44 @@ export async function loadRelay({
       }
       if (path.startsWith('/channels/') && path.endsWith('/messages') && options.method === 'POST') {
         return post ? post(options.body, path, calls) : { ok: true }
+      }
+      if (path === '/harnesses') {
+        return { harnesses: [
+          { provider: 'claude', sessionCount: 1, status: 'installed', version: '2.1.0' },
+          { provider: 'codex', sessionCount: 1, status: 'installed' },
+          { provider: 'hermes', sessionCount: 0, status: 'unsupported' },
+          { provider: 'opencode', sessionCount: 0, status: 'unavailable' },
+          { provider: 'pi', sessionCount: 0, status: 'unsupported' },
+          { provider: 'prime-agent', sessionCount: 0, status: 'unsupported' }
+        ] }
+      }
+      const harnessSession = path.match(/^\/harnesses\/([a-z-]+)\/sessions\/([^/]+)$/)
+      if (harnessSession) {
+        return {
+          snapshot: {
+            capturedAt: '2026-08-25T01:00:00.000Z',
+            eventTypes: ['user-message', 'assistant-message'],
+            id: decodeURIComponent(harnessSession[2]),
+            lineCount: 12,
+            byteCount: 2048,
+            preview: `snapshot for ${decodeURIComponent(harnessSession[2])}`,
+            provider: harnessSession[1],
+            redacted: true
+          }
+        }
+      }
+      const harnessList = path.match(/^\/harnesses\/([a-z-]+)\/sessions$/)
+      if (harnessList) {
+        return { sessions: [{
+          canWatch: false,
+          cwd: '/repo',
+          id: `${harnessList[1]}-1`,
+          preview: 'latest activity',
+          provider: harnessList[1],
+          redacted: true,
+          timestamp: '2026-08-24T09:00:00.000Z',
+          title: `Recent ${harnessList[1]} work`
+        }] }
       }
 
       throw new Error(`unexpected scoped REST path ${path}`)

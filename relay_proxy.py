@@ -1,4 +1,5 @@
-"""Loopback-only, credential-owning proxy for Relay's stable channel API.
+"""Loopback-only, credential-owning proxy for Relay's stable channel API plus
+its read-only native harness-session lane.
 
 The Desktop renderer reaches this module only through ``dashboard/plugin_api.py``.
 Credentials remain in this process and never cross the plugin REST boundary.
@@ -29,11 +30,20 @@ MAX_CHANNEL_ID_BYTES = 512
 MAX_HISTORY_LIMIT = 50
 OPERATOR_CREDENTIAL_TTL_SECONDS = 15 * 60
 OPERATOR_CREDENTIAL_TTL_MS = OPERATOR_CREDENTIAL_TTL_SECONDS * 1000
+ACTOR_CREDENTIAL_TTL_MS = 15 * 60 * 1000
+ACTOR_AUDIENCE = "relay:cli-gateway:v1"
+# Relay stamps this permissive read marker into every session:read actor
+# credential's scope; a grant must cover it for the mint to succeed.
+ACTOR_READ_TASK_REF = "relay:cli-gateway:v1:read"
 OPERATOR_CLIENT_METADATA = {
     "id": "desktop-plugin-backend",
     "displayName": "Desktop plugin backend",
     "platform": "linux",
 }
+ACTOR_CLIENT_ID = "desktop-plugin-harness-view"
+NATIVE_PROVIDERS = ("claude", "codex", "hermes", "opencode", "pi", "prime-agent")
+MAX_HARNESS_SESSIONS = 200
+MAX_SESSION_ID_BYTES = 512
 
 
 class RelayProxyError(Exception):
@@ -346,6 +356,142 @@ def project_post(payload: Any) -> dict[str, dict[str, Any]]:
     return {"message": project_message(data.get("message"))}
 
 
+def _project_preview(block: Any) -> tuple[str, bool]:
+    """Extract the shared redacted preview pair from a native-session block."""
+
+    if not isinstance(block, Mapping):
+        return "", False
+    text_value = block.get("text")
+    preview = text_value if isinstance(text_value, str) else ""
+    return preview, block.get("redacted") is True
+
+
+def project_harness_rows(payload: Any) -> list[dict[str, Any]]:
+    """Project the native-session registry report into ordered harness rows."""
+
+    data = _mapping(payload)
+    sessions = data.get("sessions")
+    providers = data.get("providers")
+    if not isinstance(sessions, list) or not isinstance(providers, list):
+        raise RelayMalformedResponseError()
+    counts: dict[str, int] = {}
+    for row in sessions:
+        summary = _mapping(row)
+        provider = summary.get("provider")
+        if not isinstance(provider, str):
+            raise RelayMalformedResponseError()
+        counts[provider] = counts.get(provider, 0) + 1
+    statuses: dict[str, Mapping[str, Any]] = {}
+    for row in providers:
+        item = _mapping(row)
+        provider = item.get("provider")
+        status = item.get("status")
+        if not isinstance(provider, str) or status not in (
+            "installed",
+            "unavailable",
+            "unsupported",
+        ):
+            raise RelayMalformedResponseError()
+        statuses[provider] = item
+    rows: list[dict[str, Any]] = []
+    for provider in NATIVE_PROVIDERS:
+        item = statuses.get(provider)
+        if item is None:
+            continue
+        row: dict[str, Any] = {
+            "provider": provider,
+            "status": item["status"],
+            "sessionCount": counts.get(provider, 0),
+        }
+        version = item.get("version")
+        if isinstance(version, str) and version:
+            row["version"] = version
+        rows.append(row)
+    return rows
+
+
+def project_native_session_summaries(payload: Any) -> list[dict[str, Any]]:
+    """Project native session summaries into bounded, renderer-safe rows."""
+
+    data = _mapping(payload)
+    sessions = data.get("sessions")
+    if not isinstance(sessions, list):
+        raise RelayMalformedResponseError()
+    projected: list[dict[str, Any]] = []
+    for row in sessions[:MAX_HARNESS_SESSIONS]:
+        summary = _mapping(row)
+        provider = summary.get("provider")
+        native_id = summary.get("nativeId")
+        if not isinstance(provider, str) or not isinstance(native_id, str) or not native_id:
+            raise RelayMalformedResponseError()
+        preview, redacted = _project_preview(summary.get("preview"))
+        title = summary.get("title")
+        cwd = summary.get("cwd")
+        stamp = summary.get("lastMessageAt")
+        if not isinstance(stamp, str):
+            stamp = summary.get("updatedAt")
+        if not isinstance(stamp, str):
+            stamp = summary.get("createdAt")
+        if not isinstance(stamp, str):
+            stamp = ""
+        capabilities = summary.get("capabilities")
+        can_watch = (
+            isinstance(capabilities, Mapping)
+            and capabilities.get("canStreamLiveEvents") is True
+        )
+        projected.append(
+            {
+                "id": native_id,
+                "provider": provider,
+                "title": title if isinstance(title, str) else "",
+                "cwd": cwd if isinstance(cwd, str) else "",
+                "preview": preview,
+                "redacted": redacted,
+                # ISO-8601 stamps sort lexicographically; empty sorts oldest.
+                "updatedAt": stamp,
+                "canWatch": can_watch,
+            }
+        )
+    projected.sort(key=lambda row: row["updatedAt"], reverse=True)
+    return projected
+
+
+def project_native_session_snapshot(payload: Any) -> dict[str, Any]:
+    """Project one bounded provider-state snapshot for renderer display."""
+
+    data = _mapping(payload)
+    snapshot = _mapping(data.get("snapshot"))
+    ref = _mapping(snapshot.get("ref"))
+    summary = _mapping(snapshot.get("summary"))
+    captured_at = snapshot.get("capturedAt")
+    native_id = ref.get("nativeId")
+    provider = ref.get("provider")
+    if (
+        not isinstance(captured_at, str)
+        or not isinstance(native_id, str)
+        or not native_id
+        or not isinstance(provider, str)
+    ):
+        raise RelayMalformedResponseError()
+    preview, redacted = _project_preview(summary.get("preview"))
+    result: dict[str, Any] = {
+        "id": native_id,
+        "provider": provider,
+        "capturedAt": captured_at,
+        "preview": preview,
+        "redacted": redacted,
+    }
+    for key in ("lineCount", "byteCount"):
+        value = summary.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            result[key] = value
+    event_types = summary.get("eventTypes")
+    if isinstance(event_types, list):
+        names = [name for name in event_types if isinstance(name, str)]
+        result["eventTypes"] = names[:12]
+    return result
+
+
 @dataclass(frozen=True)
 class ConnectionStatus:
     status: str
@@ -571,6 +717,238 @@ class RelayProxy:
         )
 
 
+class ActorLaneClient:
+    """Scoped actor-token lane client for read-only native harness sessions.
+
+    Deliberately separate from ``RelayProxy``: the two credential families have
+    different audiences, capabilities, and failure domains, and mixing them
+    would let a channels-only credential drift into session reads or vice
+    versa. Tokens stay inside this process, exactly like the operator-client
+    credential.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str = DEFAULT_RELAY_IDE_URL,
+        actor_token: str | None = None,
+        grant: str | None = None,
+        transport: RelayTransport | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._configuration_error = False
+        try:
+            self._base_url = validate_relay_base_url(base_url)
+        except RelayConfigurationError:
+            self._base_url = ""
+            self._configuration_error = True
+        self._transport = transport or UrlLibRelayTransport()
+        self._clock = clock
+        self._configured_token = actor_token if actor_token else None
+        self._grant = grant if grant else None
+        # A configured environment token's real TTL is unknown; bound it to the
+        # standard ceiling so stale tokens fail closed here too.
+        self._configured_deadline = (
+            self._clock() + ACTOR_CREDENTIAL_TTL_MS / 1000
+            if self._configured_token is not None
+            else None
+        )
+        self._issued_token: str | None = None
+        self._issued_deadline: float | None = None
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_environment(
+        cls, environment: Mapping[str, str] | None = None
+    ) -> ActorLaneClient:
+        env = os.environ if environment is None else environment
+        return cls(
+            base_url=env.get("RELAY_IDE_URL", DEFAULT_RELAY_IDE_URL),
+            actor_token=env.get("RELAY_IDE_ACTOR_TOKEN"),
+            grant=env.get("RELAY_IDE_ACTOR_GRANT"),
+        )
+
+    def _active_token(self) -> str | None:
+        with self._lock:
+            if (
+                self._configured_token is not None
+                and self._configured_deadline is not None
+                and self._clock() >= self._configured_deadline
+            ):
+                self._configured_token = None
+                self._configured_deadline = None
+            if (
+                self._issued_token is not None
+                and self._issued_deadline is not None
+                and self._clock() >= self._issued_deadline
+            ):
+                self._issued_token = None
+                self._issued_deadline = None
+            return self._issued_token or self._configured_token
+
+    def _clear_issued_token(self, token: str) -> None:
+        with self._lock:
+            if self._issued_token == token:
+                self._issued_token = None
+                self._issued_deadline = None
+
+    def _url(self, path: str) -> str:
+        if self._configuration_error:
+            raise RelayConfigurationError()
+        return f"{self._base_url}{path}"
+
+    @staticmethod
+    def _headers(command: str, token: str | None) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json",
+            "x-relay-cli-gateway": "v1",
+            "x-relay-cli-command": command,
+            # The versioned actor marker selects the scoped actor lane before
+            # any bearer-prefix sniffing happens on the hub.
+            "x-relay-cli-actor-token": "v1",
+            "x-relay-capabilities": "session:read",
+        }
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def _actor_request(
+        self,
+        *,
+        command: str,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+    ) -> Any:
+        token = self._active_token()
+        if not token:
+            raise RelayAuthRequiredError()
+        headers = self._headers(command, token)
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        response = self._transport.request(
+            method=method,
+            url=self._url(path),
+            headers=headers,
+            body=body,
+        )
+        if 200 <= response.status_code < 300:
+            return response.payload
+        if response.status_code in (401, 403):
+            self._clear_issued_token(token)
+            raise RelayAuthRequiredError(response.status_code)
+        if response.status_code >= 500:
+            raise RelayUnavailableError()
+        raise RelayUpstreamError(response.status_code)
+
+    def authorize(self) -> ConnectionStatus:
+        """Redeem at most one grant; the returned token never leaves here."""
+
+        if self._configuration_error:
+            return ConnectionStatus("error", "Relay URL is invalid")
+        if self._active_token() is not None:
+            return ConnectionStatus("ready")
+        with self._lock:
+            grant = self._grant
+            # Claim before I/O so a retry can never replay the one-time handle.
+            self._grant = None
+        if grant is None:
+            raise RelayAuthRequiredError()
+        issue_body = json.dumps(
+            {
+                "grantHandle": grant,
+                "audience": ACTOR_AUDIENCE,
+                "actor": {"type": "cli", "id": ACTOR_CLIENT_ID},
+                "capabilities": ["session:read"],
+                "ttlMs": ACTOR_CREDENTIAL_TTL_MS,
+                "scope": {"taskRefs": [ACTOR_READ_TASK_REF]},
+                "correlationId": f"{ACTOR_CLIENT_ID}-authorize",
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        response = self._transport.request(
+            method="POST",
+            url=self._url("/cli-gateway/actor-credentials"),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            body=issue_body,
+        )
+        if response.status_code < 200 or response.status_code >= 300:
+            if 400 <= response.status_code < 500:
+                raise RelayAuthRequiredError(response.status_code)
+            raise RelayUnavailableError()
+        issued = _mapping(response.payload)
+        token = issued.get("token")
+        if not isinstance(token, str) or not token.startswith("relay-sac-v1."):
+            raise RelayMalformedResponseError()
+        _mapping(issued.get("credential"))
+        with self._lock:
+            self._issued_token = token
+            self._issued_deadline = self._clock() + ACTOR_CREDENTIAL_TTL_MS / 1000
+        return ConnectionStatus("ready")
+
+    def harnesses(self) -> list[dict[str, Any]]:
+        """Per-harness install rows with live session counts, hub-ordered."""
+
+        return project_harness_rows(
+            self._actor_request(
+                command="sessions.native.list", method="GET", path="/sessions/native"
+            )
+        )
+
+    def harness_sessions(self, provider: str) -> list[dict[str, Any]]:
+        """Bounded session summaries for one provider, newest first."""
+
+        if provider not in NATIVE_PROVIDERS:
+            raise RelayConfigurationError()
+        encoded = quote(provider, safe="")
+        return project_native_session_summaries(
+            self._actor_request(
+                command="sessions.native.list",
+                method="GET",
+                path=f"/sessions/native?provider={encoded}",
+            )
+        )
+
+    def harness_session(self, provider: str, native_id: str) -> dict[str, Any]:
+        """One bounded provider-state snapshot."""
+
+        if provider not in NATIVE_PROVIDERS:
+            raise RelayConfigurationError()
+        if not native_id or len(native_id.encode("utf-8")) > MAX_SESSION_ID_BYTES:
+            raise RelayConfigurationError()
+        encoded_provider = quote(provider, safe="")
+        encoded_id = quote(native_id, safe="")
+        return project_native_session_snapshot(
+            self._actor_request(
+                command="sessions.native.get",
+                method="GET",
+                path=f"/sessions/native/{encoded_provider}/{encoded_id}",
+            )
+        )
+
+
+_actor_lane_lock = threading.Lock()
+_actor_lane: ActorLaneClient | None = None
+
+
+def get_actor_lane() -> ActorLaneClient:
+    """Return the one process-local actor-lane client for this package."""
+
+    global _actor_lane
+    with _actor_lane_lock:
+        if _actor_lane is None:
+            _actor_lane = ActorLaneClient.from_environment()
+        return _actor_lane
+
+
+def reset_actor_lane_for_tests(lane: ActorLaneClient | None = None) -> None:
+    """Test-only seam; production never persists or swaps credentials."""
+
+    global _actor_lane
+    with _actor_lane_lock:
+        _actor_lane = lane
+
+
 _proxy_lock = threading.Lock()
 _proxy: RelayProxy | None = None
 
@@ -594,12 +972,20 @@ def reset_relay_proxy_for_tests(proxy: RelayProxy | None = None) -> None:
 
 
 __all__ = [
+    "ACTOR_AUDIENCE",
+    "ACTOR_CREDENTIAL_TTL_MS",
+    "ACTOR_CLIENT_ID",
+    "ACTOR_READ_TASK_REF",
+    "ActorLaneClient",
     "DEFAULT_RELAY_IDE_URL",
     "MAX_CHANNEL_ID_BYTES",
     "MAX_CLIENT_MESSAGE_ID_BYTES",
+    "MAX_HARNESS_SESSIONS",
     "MAX_HISTORY_LIMIT",
     "MAX_MESSAGE_TEXT_BYTES",
     "MAX_RELAY_RESPONSE_BYTES",
+    "MAX_SESSION_ID_BYTES",
+    "NATIVE_PROVIDERS",
     "OPERATOR_CLIENT_METADATA",
     "OPERATOR_CREDENTIAL_TTL_MS",
     "ConnectionStatus",
@@ -613,12 +999,17 @@ __all__ = [
     "RelayUnavailableError",
     "RelayUpstreamError",
     "UrlLibRelayTransport",
+    "get_actor_lane",
     "get_relay_proxy",
     "project_channel",
     "project_channels",
+    "project_harness_rows",
     "project_history",
     "project_message",
+    "project_native_session_snapshot",
+    "project_native_session_summaries",
     "project_post",
+    "reset_actor_lane_for_tests",
     "reset_relay_proxy_for_tests",
     "validate_relay_base_url",
 ]

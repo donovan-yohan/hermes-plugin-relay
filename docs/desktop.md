@@ -16,6 +16,15 @@ The workspace renders connection state, channel inventory, the selected
 transcript, and a message composer without touching Hermes sessions or composer
 middleware.
 
+A second sidebar surface, **Harnesses**, is a read-only inspector over the
+native coding-agent sessions Relay already tracks (Claude Code, Codex, Pi,
+Prime Agent, plus Hermes/OpenCode rows when Relay reports them). Harnesses
+render as collapsible groups with an install-status dot, session count, and
+optional version; expanding an installed group loads that provider's native
+session summaries (newest first), and selecting one shows a bounded, redacted
+snapshot. This surface never renders a composer: the hub contract for native
+sessions is strictly read-only observation.
+
 This backend deliberately exposes no `/events` endpoint. Desktop refreshes its
 visible page every three seconds instead of pretending that a local poll is a
 stream.
@@ -27,6 +36,22 @@ stream.
 - `GET /channels`
 - `GET /channels/:id/messages?limit=50` (1–50 only)
 - `POST /channels/:id/messages`
+
+### Native harness-session endpoints
+
+These routes ride a separate scoped actor-token lane and return only projected,
+renderer-safe fields:
+
+- `GET /harnesses` → per-provider `{ provider, status, sessionCount, version? }`
+- `GET /harnesses/:provider/sessions` → bounded summaries (`id`, `title`,
+  `cwd`, `preview`, `updatedAt`, `canWatch`, `redacted`), newest first
+- `GET /harnesses/:provider/sessions/:nativeId` → one bounded snapshot
+  (`capturedAt`, `preview`, `lineCount`, `byteCount`, `eventTypes`, `redacted`)
+
+Unknown providers, oversized ids, and malformed upstream payloads fail closed.
+Native transcript source paths, hashes, and provider-internal metadata are
+stripped before anything reaches the renderer. There is no write path: the
+plugin cannot create, resume, inject into, or delete any harness session.
 
 Message posts accept exactly:
 
@@ -61,6 +86,16 @@ one-time `RELAY_IDE_OPERATOR_GRANT` using fixed generic client metadata and
 only `context:read` / `context:write`. Every supplied or returned credential is
 held only in this Python process and is locally bounded to 15 minutes. It is
 cleared on local expiry and any Relay 401/403.
+
+The harness-session surface uses a second, independent credential family.
+`RELAY_IDE_ACTOR_TOKEN` supplies an existing Relay scoped actor token
+(`relay-sac-v1…`) with `session:read`; otherwise `RELAY_IDE_ACTOR_GRANT`
+supplies a one-time handshake grant that is redeemed (once) for
+audience `relay:cli-gateway:v1`, capability `session:read`, and the standard
+read task-ref scope. The two lanes never share tokens: channels stay on the
+operator-client credential and native sessions on the actor credential, so a
+compromise or failure of one cannot widen into the other. Actor tokens obey the
+same in-process-only, 15-minute-ceiling, cleared-on-401/403 rules.
 
 Neither token nor grant is ever returned to Desktop JavaScript, included in a
 URL, written to config/files, placed in test fixtures, or logged by this

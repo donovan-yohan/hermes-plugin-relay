@@ -126,19 +126,40 @@ def test_status_and_channel_routes_use_only_safe_projected_data(client, api_modu
 
 def test_authorize_never_returns_grant_or_issued_credential(client, api_module):
     issued_material = "relay-occ-v1.test.value"
+    actor_material = "relay-sac-v1.test.value"
     grant_material = "approved-one-time-value"
 
     def handler(**call):
-        assert json.loads(call["body"])["grantHandle"] == grant_material
+        body = json.loads(call["body"]) if call["body"] else {}
+        if call["method"] == "GET" and call["url"].endswith("/channels"):
+            return RelayHttpResponse(200, {"channels": []})
+        if call["url"].endswith("/cli-gateway/actor-credentials"):
+            assert body.get("grantHandle") == "actor-grant-material"
+            return RelayHttpResponse(201, {"token": actor_material, "credential": {"id": "sac:test"}})
+        assert body.get("grantHandle") == grant_material
         return RelayHttpResponse(201, {"token": issued_material, "credential": {"id": "occ:test"}})
 
-    transport = install_proxy(api_module, handler, credential=None, grant=grant_material)
+    channel_transport = install_proxy(api_module, handler, credential=None, grant=grant_material)
+    actor_transport = install_actor_lane(api_module, handler, grant="actor-grant-material")
     response = client.post(f"{PREFIX}/connection/authorize")
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
-    assert issued_material not in response.text
-    assert grant_material not in response.text
-    assert issued_material not in transport.calls[0]["url"]
+    for secret in (issued_material, actor_material, grant_material, "actor-grant-material"):
+        assert secret not in response.text
+    assert issued_material not in channel_transport.calls[0]["url"]
+
+    # Re-authorize while both credentials live is a no-op: neither one-time
+    # grant is replayed.
+    def issue_calls():
+        return [
+            call for call in [*channel_transport.calls, *actor_transport.calls]
+            if call["url"].endswith("-credentials")
+        ]
+
+    assert len(issue_calls()) == 2
+    response = client.post(f"{PREFIX}/connection/authorize")
+    assert response.json() == {"status": "ready"}
+    assert len(issue_calls()) == 2
 
 
 def test_authorize_without_a_grant_is_honestly_auth_required(client, api_module):

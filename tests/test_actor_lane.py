@@ -256,10 +256,17 @@ def test_actor_headers_carry_lane_markers_and_command():
     lane.harnesses()
     call = transport.calls[0]
     assert call["url"].endswith(NATIVE_LIST_PATH)
-    assert call["headers"]["x-relay-cli-actor-token"] == "v1"
-    assert call["headers"]["x-relay-cli-command"] == "sessions.native.list"
-    assert call["headers"]["x-relay-capabilities"] == "session:read"
-    assert call["headers"]["Authorization"] == "Bearer configured-sac"
+    # Exact header dict: the actor marker must be present, the operator-client
+    # channel-lane markers must never bleed into this lane.
+    assert call["headers"] == {
+        "Accept": "application/json",
+        "x-relay-cli-gateway": "v1",
+        "x-relay-cli-command": "sessions.native.list",
+        "x-relay-cli-actor-token": "v1",
+        "x-relay-capabilities": "session:read",
+        "Authorization": "Bearer configured-sac",
+    }
+    assert "x-relay-operator-client-token" not in call["headers"]
 
 
 def test_provider_scoped_list_encodes_query_and_get_encodes_path_segments():

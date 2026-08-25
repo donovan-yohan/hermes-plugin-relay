@@ -756,7 +756,7 @@ function RelayPage() {
   const historyGeneration = useRef(0)
   const storedSelectionRead = useRef(false)
   const retryRef = useRef(null)
-  const sessionGeneration = useRef(0)
+  const sessionGeneration = useRef({})
   const detailGeneration = useRef(0)
 
   connectionRef.current = connection
@@ -979,12 +979,16 @@ function RelayPage() {
         : [...current, provider]
     )
 
-    if (expandedProviders.includes(provider)) {
+    if (expandedProviders.includes(provider) || !harnesses.some(row => row.provider === provider && row.status === 'installed')) {
       return
     }
 
     // First expansion loads (or refreshes once per mount) that harness's rows.
-    const generation = ++sessionGeneration.current
+    // Generations are per provider so one harness's refresh can never discard
+    // another's in-flight response.
+    const generation = (sessionGeneration.current[provider] || 0) + 1
+
+    sessionGeneration.current = { ...sessionGeneration.current, [provider]: generation }
 
     setSessionCache(cache => ({
       ...cache,
@@ -995,13 +999,13 @@ function RelayPage() {
       try {
         const sessions = normalizeHarnessSessions(await ctx.rest(`/harnesses/${encodeURIComponent(provider)}/sessions`), provider)
 
-        if (generation !== sessionGeneration.current) {
+        if (generation !== sessionGeneration.current[provider]) {
           return
         }
 
         setSessionCache(cache => ({ ...cache, [provider]: { error: '', loading: false, sessions } }))
       } catch (error) {
-        if (generation !== sessionGeneration.current) {
+        if (generation !== sessionGeneration.current[provider]) {
           return
         }
 
@@ -1015,7 +1019,7 @@ function RelayPage() {
         }))
       }
     })()
-  }, [ctx, expandedProviders])
+  }, [ctx, expandedProviders, harnesses])
 
   const chooseSession = useCallback(async (provider, sessionId) => {
     if (!provider || !sessionId || typeof ctx?.rest !== 'function') {

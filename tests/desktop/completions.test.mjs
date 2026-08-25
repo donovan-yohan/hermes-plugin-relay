@@ -29,9 +29,12 @@ test('is an uncompiled workspace plugin with only the permitted imports', () => 
   assert.doesNotMatch(SOURCE, /COMPOSER_AREAS|composer\.middleware|atCompletions|participant/i)
   assert.doesNotMatch(SOURCE, /host\.(?:request|openSession|newChat)|session[_./](?:create|kill|attach|input)|ctx\.socket|onEvent/i)
   assert.doesNotMatch(SOURCE, /\bfetch\(|XMLHttpRequest|https?:\/\/|<iframe|iframe/i)
-  assert.doesNotMatch(SOURCE, /storage\.(?:set|get)\([^)]*(?:token|credential|secret|auth)/i)
-  assert.match(SOURCE, /relay\.selection\.channelId/)
-  assert.doesNotMatch(SOURCE, /ctx\.storage\.(?:set|get)\([^)]*(?!relay\.selection\.channelId)/)
+  // Every storage call must target the non-secret channel selection key.
+  const storageCalls = [...SOURCE.matchAll(/ctx\?\.storage\?\.(set|get)\?\.\('([^']+)'/g)]
+  assert.ok(storageCalls.length >= 2, 'storage access is explicit and auditable')
+  for (const [, , key] of storageCalls) {
+    assert.strictEqual(key, 'relay.selection.channelId', 'only the selection key is touched')
+  }
 })
 
 test('registers one full /relay route and one top-level Relay pane tab', async () => {
@@ -196,6 +199,10 @@ test('selecting a harness session shows a redacted snapshot without leaking path
   const detailText = textContent(app.tree)
   assert.match(detailText, /snapshot for codex-1/, 'the bounded preview is rendered')
   assert.match(detailText, /redacted preview/, 'the redaction marker is surfaced honestly')
+  // No POSIX-absolute or home-relative path shape may appear anywhere in the
+  // rendered harness surface (the hub never sends one; this pins that).
+  assert.doesNotMatch(detailText, /(?:\/home\/|\/Users\/|~\/)[\w./-]+/, 'no filesystem path reaches the renderer')
+  assert.doesNotMatch(JSON.stringify(app.tree), /sourcePath|stateRoot|hashSha256/i, 'no private snapshot metadata keys are rendered')
 
   // The channels composer must not be present on the harness surface.
   assert.strictEqual(findAll(app.tree, node => node.type === 'form').length, 0, 'the read-only surface never renders a composer')

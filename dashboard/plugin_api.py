@@ -18,6 +18,8 @@ from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
+from hermes_plugin_relay.relay_proxy import ConnectionStatus  # noqa: F401 (re-exported for route helpers)
+
 router = APIRouter()
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -224,7 +226,15 @@ async def connection_authorize(request: Request) -> Any:
         # renderer cannot smuggle client metadata, scope, or a grant through it.
         if await _read_request_body(request):
             raise RequestValidationError(400, "invalid_body", "Authorization does not accept a body")
-        return (await run_in_threadpool(_proxy().authorize)).to_wire()
+        channel_status = await run_in_threadpool(_proxy().authorize)
+        harness_status = await run_in_threadpool(_actor_lane().authorize)
+        statuses = [channel_status, harness_status]
+        # Report the worst lane honestly: an error beats auth_required.
+        if any(status.status == "error" for status in statuses):
+            return ConnectionStatus("error", "Relay URL is invalid").to_wire()
+        if any(status.status != "ready" for status in statuses):
+            return ConnectionStatus("auth_required", "Relay authorization is required").to_wire()
+        return ConnectionStatus("ready").to_wire()
     except RequestValidationError as error:
         return _error(error.status_code, error.code, error.message)
     except RelayProxyError as error:

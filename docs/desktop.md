@@ -44,7 +44,9 @@ renderer-safe fields:
 
 - `GET /harnesses` → per-provider `{ provider, status, sessionCount, version? }`
 - `GET /harnesses/:provider/sessions` → bounded summaries (`id`, `title`,
-  `cwd`, `preview`, `updatedAt`, `canWatch`, `redacted`), newest first
+  `cwd`, `preview`, `updatedAt`, `canWatch`, `redacted`), newest first.
+  `cwd` is the harness's own recorded working directory, surfaced for
+  orientation only; it is not used by this backend for any access decision.
 - `GET /harnesses/:provider/sessions/:nativeId` → one bounded snapshot
   (`capturedAt`, `preview`, `lineCount`, `byteCount`, `eventTypes`, `redacted`)
 

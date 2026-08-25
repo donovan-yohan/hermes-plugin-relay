@@ -203,6 +203,7 @@ def test_snapshot_projection_keeps_bounds_and_drops_paths():
 
 def make_lane(handler, **kwargs):
     transport = RecordingTransport(handler)
+    kwargs.setdefault("token_file", None)
     lane = ActorLaneClient(transport=transport, **kwargs)
     return lane, transport
 
@@ -335,3 +336,124 @@ def test_environment_construction_reads_both_lanes_independently(monkeypatch):
     lane = ActorLaneClient.from_environment()
     assert lane._base_url == "http://127.0.0.1:9999"
     assert lane._grant == "env-grant-value"
+
+
+# --- login file (#1435) + renewal --------------------------------------------
+
+
+def test_login_file_token_is_loaded_and_caches(tmp_path):
+    token = "relay-sac-v1.from-file"
+    expires_at = "2099-01-01T00:00:00.000Z"
+    file_path = tmp_path / "actor-token.json"
+    file_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "token": token,
+                "credentialId": "sac:file",
+                "hubUrl": "http://127.0.0.1:3456",
+                "issuedAt": "2026-08-25T00:00:00.000Z",
+                "expiresAt": expires_at,
+                "actorId": "relay-cli@test",
+                "capabilities": ["session:read"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def handler(**_call):
+        return RelayHttpResponse(200, harness_report())
+
+    lane, transport = make_lane(handler, token_file=str(file_path))
+    lane.harnesses()
+    assert transport.calls[0]["headers"]["Authorization"] == f"Bearer {token}"
+
+
+def test_login_file_expired_or_missing_yields_nothing(tmp_path, monkeypatch):
+    # The real file on this machine must not leak into this test.
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def handler(**_call):
+        return RelayHttpResponse(200, harness_report())
+
+    # No file at all.
+    lane, _ = make_lane(handler, token_file=str(tmp_path / "nonexistent.json"))
+    with pytest.raises(RelayAuthRequiredError):
+        lane.harnesses()
+
+    # Expired file.
+    expired = tmp_path / "expired.json"
+    expired.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "token": "relay-sac-v1.expired",
+                "expiresAt": "2020-01-01T00:00:00.000Z",
+                "credentialId": "x",
+                "hubUrl": "http://127.0.0.1:3456",
+                "issuedAt": "2020-01-01T00:00:00.000Z",
+                "actorId": "x",
+                "capabilities": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    lane, transport = make_lane(handler, token_file=str(expired))
+    # Prove no live token leaked from the real machine.
+    assert lane._configured_token is None
+    assert lane._grant is None
+    assert lane._token_file == str(expired)
+    active = lane._active_token()
+    assert active is None, f"expected no active token, got {active!r}"
+    with pytest.raises(RelayAuthRequiredError):
+        lane.harnesses()
+
+
+def test_renewal_fires_before_expiry_and_swaps_token():
+    clock = [100.0]
+    original_token = "relay-sac-v1.original"
+    renewed_token = "relay-sac-v1.renewed"
+    renew_path = "/cli-gateway/actor-credentials/renew"
+
+    def handler(**call):
+        if call["url"].endswith(renew_path):
+            assert call["headers"]["x-relay-cli-command"] == "actor-credentials.renew"
+            return RelayHttpResponse(
+                201,
+                {
+                    "token": renewed_token,
+                    "credential": {"id": "sac:renewed", "expiresAt": "2099-01-01T00:00:00.000Z"},
+                },
+            )
+        return RelayHttpResponse(200, harness_report())
+
+    lane, transport = make_lane(handler, actor_token=original_token, clock=lambda: clock[0])
+    # Set the configured deadline so _maybe_renew sees it within the margin.
+    with lane._lock:
+        lane._configured_deadline = clock[0] + 60  # < 120s margin
+
+    lane.harnesses()
+    # The renew call happened and the new token is now active.
+    renew_calls = [c for c in transport.calls if c["url"].endswith(renew_path)]
+    assert len(renew_calls) == 1
+    assert renew_calls[0]["headers"]["Authorization"] == f"Bearer {original_token}"
+    # The native-list call used the renewed token.
+    list_calls = [c for c in transport.calls if c["url"].endswith("/sessions/native")]
+    assert list_calls[0]["headers"]["Authorization"] == f"Bearer {renewed_token}"
+
+
+def test_renewal_failure_keeps_old_token_working():
+    clock = [100.0]
+
+    def handler(**call):
+        if call["url"].endswith("/cli-gateway/actor-credentials/renew"):
+            return RelayHttpResponse(503, None)
+        return RelayHttpResponse(200, harness_report())
+
+    lane, transport = make_lane(handler, actor_token="relay-sac-v1.original", clock=lambda: clock[0])
+    with lane._lock:
+        lane._configured_deadline = clock[0] + 60
+
+    lane.harnesses()
+    list_calls = [c for c in transport.calls if c["url"].endswith("/sessions/native")]
+    assert list_calls[0]["headers"]["Authorization"] == "Bearer relay-sac-v1.original"

@@ -25,14 +25,15 @@ const HISTORY_LIMIT = 50
 const CONNECTION_STATES = new Set(['ready', 'offline', 'auth_required', 'error'])
 const NON_RETRYABLE_STATUS_CODES = new Set([400, 404, 409, 413])
 const RELAY_WORKSPACE_ID = `${PLUGIN_ID}:home`
-const HARNESS_PROVIDERS = ['claude', 'codex', 'hermes', 'opencode', 'pi', 'prime-agent']
+const HARNESS_PROVIDERS = ['claude', 'codex', 'hermes', 'opencode', 'pi', 'prime-agent', 'dsh']
 const HARNESS_META = {
   claude: { label: 'Claude Code' },
   codex: { label: 'Codex' },
   hermes: { label: 'Hermes' },
   opencode: { label: 'OpenCode' },
   pi: { label: 'Pi' },
-  'prime-agent': { label: 'Prime Agent' }
+  'prime-agent': { label: 'Prime Agent' },
+  dsh: { label: 'DeepSeek Harness' }
 }
 const STATUS_TONES = {
   installed: 'good',

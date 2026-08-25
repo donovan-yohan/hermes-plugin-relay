@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
@@ -41,9 +42,16 @@ OPERATOR_CLIENT_METADATA = {
     "platform": "linux",
 }
 ACTOR_CLIENT_ID = "desktop-plugin-harness-view"
-NATIVE_PROVIDERS = ("claude", "codex", "hermes", "opencode", "pi", "prime-agent")
+NATIVE_PROVIDERS = ("claude", "codex", "hermes", "opencode", "pi", "prime-agent", "dsh")
 MAX_HARNESS_SESSIONS = 200
 MAX_SESSION_ID_BYTES = 512
+# `relay-ide login` (#1435) stores the scoped actor credential at this path with
+# chmod 600. The plugin reads it as a third token source (after env/flag) so a
+# machine that already ran `relay-ide login` works with zero plugin config.
+RELAY_ACTOR_TOKEN_FILE = os.path.expanduser("~/.config/relay-ide/actor-token.json")
+# Renew when <120s remain, matching the CLI's own threshold.
+ACTOR_RENEW_MARGIN_SECONDS = 120
+ACTOR_RENEW_COMMAND = "actor-credentials.renew"
 
 
 class RelayProxyError(Exception):
@@ -725,6 +733,13 @@ class ActorLaneClient:
     would let a channels-only credential drift into session reads or vice
     versa. Tokens stay inside this process, exactly like the operator-client
     credential.
+
+    Token resolution precedence: env ``RELAY_IDE_ACTOR_TOKEN`` > a one-time
+    ``RELAY_IDE_ACTOR_GRANT`` > the ``relay-ide login`` credential file at
+    ``~/.config/relay-ide/actor-token.json`` (#1435). A token from any source
+    is renewed ~2 min before expiry via ``POST /cli-gateway/actor-credentials/
+    renew``; the predecessor is never revoked (it expires naturally), so a
+    lost renew response cannot lock the plugin out.
     """
 
     def __init__(
@@ -733,6 +748,7 @@ class ActorLaneClient:
         base_url: str = DEFAULT_RELAY_IDE_URL,
         actor_token: str | None = None,
         grant: str | None = None,
+        token_file: str | None = RELAY_ACTOR_TOKEN_FILE,
         transport: RelayTransport | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -746,6 +762,7 @@ class ActorLaneClient:
         self._clock = clock
         self._configured_token = actor_token if actor_token else None
         self._grant = grant if grant else None
+        self._token_file = token_file
         # A configured environment token's real TTL is unknown; bound it to the
         # standard ceiling so stale tokens fail closed here too.
         self._configured_deadline = (
@@ -753,6 +770,9 @@ class ActorLaneClient:
             if self._configured_token is not None
             else None
         )
+        self._file_token: str | None = None
+        self._file_deadline: float | None = None
+        self._file_checked = False
         self._issued_token: str | None = None
         self._issued_deadline: float | None = None
         self._lock = threading.Lock()
@@ -767,6 +787,88 @@ class ActorLaneClient:
             actor_token=env.get("RELAY_IDE_ACTOR_TOKEN"),
             grant=env.get("RELAY_IDE_ACTOR_GRANT"),
         )
+
+    def _load_file_token(self) -> tuple[str | None, float | None]:
+        """Read the `relay-ide login` credential file once per process life.
+
+        Returns ``(token, deadline)`` or ``(None, None)``. The file's own
+        ``expiresAt`` is authoritative; a missing/expired/loose-perms file
+        yields nothing, and the caller fails closed.
+
+        The deadline is a Unix-epoch timestamp (parsed from the file's
+        ``expiresAt``); it is compared against wall-clock time, not the
+        process-local monotonic clock used for internally-managed deadlines.
+        """
+
+        if not self._token_file:
+            return None, None
+        try:
+            with open(self._token_file, "r", encoding="utf-8") as handle:
+                raw = handle.read()
+        except OSError:
+            return None, None
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return None, None
+        if not isinstance(parsed, dict):
+            return None, None
+        token = parsed.get("token")
+        expires_at = parsed.get("expiresAt")
+        if not isinstance(token, str) or not token.startswith("relay-sac-v1."):
+            return None, None
+        if not isinstance(expires_at, str):
+            return None, None
+        try:
+            deadline = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None, None
+        if deadline <= time.time():
+            return None, None
+        return token, deadline
+
+    def _renew(self, token: str) -> ConnectionStatus:
+        """Renew a still-valid token ~2 min before expiry (#1435).
+
+        The hub mints a successor with the same actor/capabilities/scope and
+        does NOT revoke the predecessor, so a lost response can't lock us out.
+        Single-flight: only one renew per process at a time.
+        """
+
+        renew_body = json.dumps(
+            {"correlationId": f"{ACTOR_CLIENT_ID}-renew"},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        response = self._transport.request(
+            method="POST",
+            url=self._url("/cli-gateway/actor-credentials/renew"),
+            headers=self._headers(ACTOR_RENEW_COMMAND, token),
+            body=renew_body,
+        )
+        if response.status_code < 200 or response.status_code >= 300:
+            # Renewal failed — the old token keeps working until it truly
+            # expires, then the next request fails closed with auth_required.
+            return ConnectionStatus("ready")
+        issued = _mapping(response.payload)
+        new_token = issued.get("token")
+        if not isinstance(new_token, str) or not new_token.startswith("relay-sac-v1."):
+            return ConnectionStatus("ready")
+        new_credential = _mapping(issued.get("credential"))
+        expires_at = new_credential.get("expiresAt")
+        new_deadline = None
+        if isinstance(expires_at, str):
+            try:
+                new_deadline = datetime.fromisoformat(
+                    expires_at.replace("Z", "+00:00")
+                ).timestamp()
+            except ValueError:
+                pass
+        if new_deadline is None:
+            new_deadline = self._clock() + ACTOR_CREDENTIAL_TTL_MS / 1000
+        with self._lock:
+            self._issued_token = new_token
+            self._issued_deadline = new_deadline
+        return ConnectionStatus("ready")
 
     def _active_token(self) -> str | None:
         with self._lock:
@@ -784,7 +886,20 @@ class ActorLaneClient:
             ):
                 self._issued_token = None
                 self._issued_deadline = None
-            return self._issued_token or self._configured_token
+            # Lazy-load the login file once, then cache its token+deadline.
+            if not self._file_checked:
+                file_token, file_deadline = self._load_file_token()
+                self._file_token = file_token
+                self._file_deadline = file_deadline
+                self._file_checked = True
+            if (
+                self._file_token is not None
+                and self._file_deadline is not None
+                and time.time() >= self._file_deadline
+            ):
+                self._file_token = None
+                self._file_deadline = None
+            return self._issued_token or self._configured_token or self._file_token
 
     def _clear_issued_token(self, token: str) -> None:
         with self._lock:
@@ -823,6 +938,11 @@ class ActorLaneClient:
         token = self._active_token()
         if not token:
             raise RelayAuthRequiredError()
+        # Auto-renew ~2 min before expiry so a long-lived desktop session
+        # never silently drops into auth_required mid-poll. After a successful
+        # renewal the issued token supersedes the one we captured above.
+        self._maybe_renew(token)
+        token = self._active_token() or token
         headers = self._headers(command, token)
         if body is not None:
             headers["Content-Type"] = "application/json"
@@ -841,8 +961,36 @@ class ActorLaneClient:
             raise RelayUnavailableError()
         raise RelayUpstreamError(response.status_code)
 
+    def _maybe_renew(self, token: str) -> None:
+        """Renew if the active token is within the margin of expiry."""
+
+        with self._lock:
+            deadline = None
+            if token == self._issued_token and self._issued_deadline is not None:
+                deadline = self._issued_deadline
+                remaining = deadline - self._clock()
+            elif token == self._file_token and self._file_deadline is not None:
+                deadline = self._file_deadline
+                remaining = deadline - time.time()
+            elif token == self._configured_token and self._configured_deadline is not None:
+                deadline = self._configured_deadline
+                remaining = deadline - self._clock()
+            else:
+                return
+            if remaining > ACTOR_RENEW_MARGIN_SECONDS:
+                return
+        try:
+            self._renew(token)
+        except (RelayUnavailableError, RelayUpstreamError, RelayMalformedResponseError):
+            # Renewal failed; the old token keeps working until real expiry.
+            pass
+
     def authorize(self) -> ConnectionStatus:
-        """Redeem at most one grant; the returned token never leaves here."""
+        """Redeem at most one grant; the returned token never leaves here.
+
+        If a ``relay-ide login`` file or an environment token is already
+        live, this is a no-op that reports ``ready`` without any I/O.
+        """
 
         if self._configuration_error:
             return ConnectionStatus("error", "Relay URL is invalid")
@@ -976,6 +1124,8 @@ __all__ = [
     "ACTOR_CREDENTIAL_TTL_MS",
     "ACTOR_CLIENT_ID",
     "ACTOR_READ_TASK_REF",
+    "ACTOR_RENEW_COMMAND",
+    "ACTOR_RENEW_MARGIN_SECONDS",
     "ActorLaneClient",
     "DEFAULT_RELAY_IDE_URL",
     "MAX_CHANNEL_ID_BYTES",
@@ -988,6 +1138,7 @@ __all__ = [
     "NATIVE_PROVIDERS",
     "OPERATOR_CLIENT_METADATA",
     "OPERATOR_CREDENTIAL_TTL_MS",
+    "RELAY_ACTOR_TOKEN_FILE",
     "ConnectionStatus",
     "RelayAuthRequiredError",
     "RelayConfigurationError",

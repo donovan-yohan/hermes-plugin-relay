@@ -18,8 +18,6 @@ from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
-from hermes_plugin_relay.relay_proxy import ConnectionStatus  # noqa: F401 (re-exported for route helpers)
-
 router = APIRouter()
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -62,6 +60,7 @@ _proxy_mod = importlib.import_module(f"{_PKG}.relay_proxy")
 
 RelayAuthRequiredError = _proxy_mod.RelayAuthRequiredError
 RelayConfigurationError = _proxy_mod.RelayConfigurationError
+ConnectionStatus = _proxy_mod.ConnectionStatus
 RelayMalformedResponseError = _proxy_mod.RelayMalformedResponseError
 RelayProxyError = _proxy_mod.RelayProxyError
 RelayResponseTooLargeError = _proxy_mod.RelayResponseTooLargeError
@@ -228,13 +227,12 @@ async def connection_authorize(request: Request) -> Any:
             raise RequestValidationError(400, "invalid_body", "Authorization does not accept a body")
         channel_status = await run_in_threadpool(_proxy().authorize)
         harness_status = await run_in_threadpool(_actor_lane().authorize)
-        statuses = [channel_status, harness_status]
-        # Report the worst lane honestly: an error beats auth_required.
-        if any(status.status == "error" for status in statuses):
-            return ConnectionStatus("error", "Relay URL is invalid").to_wire()
-        if any(status.status != "ready" for status in statuses):
-            return ConnectionStatus("auth_required", "Relay authorization is required").to_wire()
-        return ConnectionStatus("ready").to_wire()
+        # Report the single worst lane honestly, with that lane's own message:
+        # error > offline > auth_required > ready. Collapsing distinct states
+        # would tell the renderer to re-authorize during a plain outage.
+        ranking = {"error": 3, "offline": 2, "auth_required": 1, "ready": 0}
+        worst = max((channel_status, harness_status), key=lambda s: ranking[s.status])
+        return worst.to_wire()
     except RequestValidationError as error:
         return _error(error.status_code, error.code, error.message)
     except RelayProxyError as error:

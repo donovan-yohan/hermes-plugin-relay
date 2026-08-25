@@ -5,9 +5,16 @@ The Desktop renderer talks only to the plugin-local REST namespace:
 from this standalone plugin; the renderer cannot address Relay directly or read
 plugin process environment variables.
 
-`desktop/plugin.js` contributes the full `/relay` route and sidebar entry. It
-renders connection state, channel inventory, the selected transcript, and a
-message composer without touching Hermes sessions or composer middleware.
+`desktop/plugin.js` contributes a top-level **Relay** pane center-docked into
+the Sessions zone, producing the same `SESSIONS | BOTS | RELAY` tab strip used
+by Bot Mode. Selecting it opens a plugin-owned main-area workspace; switching
+away tears that workspace down instead of leaving Relay stapled into ordinary
+session navigation. The full `/relay` route remains as a deep-link and
+older-Desktop fallback, but there is no `sidebar.nav` list row.
+
+The workspace renders connection state, channel inventory, the selected
+transcript, and a message composer without touching Hermes sessions or composer
+middleware.
 
 This backend deliberately exposes no `/events` endpoint. Desktop refreshes its
 visible page every three seconds instead of pretending that a local poll is a

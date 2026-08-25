@@ -17,10 +17,11 @@ function callForm(app) {
   return form
 }
 
-test('is an uncompiled route-only plugin with only the permitted imports', () => {
+test('is an uncompiled workspace plugin with only the permitted imports', () => {
   assert.deepStrictEqual(sourceImports(SOURCE), ['@hermes/plugin-sdk', 'react', 'react/jsx-runtime'])
   assert.match(SOURCE, /ROUTES_AREA/)
-  assert.match(SOURCE, /SIDEBAR_NAV_AREA/)
+  assert.match(SOURCE, /area: 'panes'/)
+  assert.doesNotMatch(SOURCE, /SIDEBAR_NAV_AREA|sidebar\.nav/)
   assert.doesNotMatch(SOURCE, /COMPOSER_AREAS|composer\.middleware|atCompletions|participant/i)
   assert.doesNotMatch(SOURCE, /host\.(?:request|openSession|newChat)|session[_./]|provider|claude|codex/i)
   assert.doesNotMatch(SOURCE, /\bfetch\(|XMLHttpRequest|https?:\/\/|<iframe|iframe/i)
@@ -29,7 +30,7 @@ test('is an uncompiled route-only plugin with only the permitted imports', () =>
   assert.doesNotMatch(SOURCE, /ctx\.storage\.(?:set|get)\([^)]*(?!relay\.selection\.channelId)/)
 })
 
-test('registers exactly one full /relay route and one sidebar entry', async () => {
+test('registers one full /relay route and one top-level Relay pane tab', async () => {
   const relay = await loadRelay()
 
   assert.strictEqual(relay.plugin.id, 'hermes-plugin-relay')
@@ -44,12 +45,49 @@ test('registers exactly one full /relay route and one sidebar entry', async () =
       render: relay.registrations[0].render
     },
     {
-      area: 'sidebar.nav',
-      data: { codicon: 'comment-discussion', label: 'Relay', path: '/relay' },
-      id: 'nav',
-      order: 55
+      area: 'panes',
+      data: {
+        collapsible: true,
+        dock: { enforce: true, pane: 'sessions', pos: 'center' },
+        hideOnly: true,
+        placement: 'left',
+        width: '260px'
+      },
+      id: 'pane',
+      render: relay.registrations[1].render,
+      title: 'Relay'
     }
   ])
+})
+
+test('opens the dedicated workspace only while the Relay tab is selected', async () => {
+  const relay = await loadRelay()
+
+  assert.deepStrictEqual(relay.visibilityRequests, ['hermes-plugin-relay:pane'])
+  assert.strictEqual(relay.workspaceOpenings.length, 0, 'the hidden tab does not steal the main workspace')
+
+  relay.setPaneVisible(true)
+  assert.strictEqual(relay.workspaceOpenings.length, 1)
+  assert.strictEqual(relay.workspaceOpenings[0].id, 'hermes-plugin-relay:home')
+  assert.strictEqual(relay.workspaceOpenings[0].options.title, 'Relay')
+  assert.strictEqual(relay.workspaceOpenings[0].options.minWidth, '32rem')
+  assert.strictEqual(typeof relay.workspaceOpenings[0].options.render, 'function')
+  assert.deepStrictEqual(relay.navigations, [], 'modern Desktop uses the main-workspace door, not route navigation')
+
+  relay.setPaneVisible(false)
+  assert.deepStrictEqual(relay.workspaceCloses, ['hermes-plugin-relay:home'])
+
+  relay.setPaneVisible(true)
+  relay.disposePlugin()
+  assert.deepStrictEqual(relay.workspaceCloses, ['hermes-plugin-relay:home', 'hermes-plugin-relay:home'])
+})
+
+test('falls back to the hidden /relay route without a main-workspace door', async () => {
+  const relay = await loadRelay({ workspaceSupported: false })
+
+  relay.setPaneVisible(true)
+  assert.deepStrictEqual(relay.navigations, ['/relay'])
+  assert.strictEqual(relay.workspaceOpenings.length, 0)
 })
 
 test('lists once, selects one channel, loads its 50-message window, and posts once', async () => {

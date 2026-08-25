@@ -1,7 +1,8 @@
 # hermes-plugin-relay
 
 A native Hermes Desktop workspace for channels on a local Relay hub. The
-uncompiled Desktop plugin contributes a `/relay` page and sidebar entry; a thin
+uncompiled Desktop plugin contributes a top-level **Relay** tab beside
+**Sessions** and **Bots**, then opens its dedicated main-area workspace. A thin
 Python dashboard API keeps Relay credentials and network access out of the
 renderer.
 
@@ -21,18 +22,19 @@ hermes plugins install donovan-yohan/hermes-plugin-relay --enable
 ```
 
 The backend and Desktop halves are separately opt-in. After installation,
-enable **Relay** in Hermes Desktop under **Settings → Plugins**, then open
-`/relay` from the sidebar. Relay itself must be running locally with the
-operator-client credential endpoints described below.
+enable **Relay** in Hermes Desktop under **Settings → Plugins**, then select the
+**Relay** tab in the sidebar's top-level tab strip. Relay itself must be running
+locally with the operator-client credential endpoints described below.
 
 ## Desktop workspace
 
-The `/relay` page lists accessible Relay channels, renders the selected
-channel's latest 50 messages with human/agent/system attribution, and posts
-Markdown messages with a stable client-generated idempotency key. It keeps a
-stale transcript and unsent draft visible while Relay is offline, and renders
-authorization, empty, archived, malformed, missing-channel, and upstream-error
-states separately.
+Selecting the **Relay** tab opens a dedicated main-area workspace. It lists
+accessible Relay channels, renders the selected channel's latest 50 messages
+with human/agent/system attribution, and posts Markdown messages with a stable
+client-generated idempotency key. It keeps a stale transcript and unsent draft
+visible while Relay is offline, and renders authorization, empty, archived,
+malformed, missing-channel, and upstream-error states separately. The hidden
+`/relay` route remains available for deep links and older Desktop builds.
 
 ## Configure the local Relay connection
 

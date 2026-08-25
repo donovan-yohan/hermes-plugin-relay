@@ -1,15 +1,16 @@
 /**
  * Relay's native Desktop client. This is an uncompiled ESM disk plugin: it owns
- * one full page and its sidebar entry, and talks only to its scoped plugin API.
+ * a top-level sidebar tab plus a full workspace, and talks only to its scoped
+ * plugin API.
  */
 
 import {
   Button,
   EmptyState,
   ErrorState,
+  host,
   Loader,
   ROUTES_AREA,
-  SIDEBAR_NAV_AREA,
   StatusDot,
   Textarea,
   cn
@@ -23,8 +24,10 @@ const POLL_INTERVAL_MS = 3_000
 const HISTORY_LIMIT = 50
 const CONNECTION_STATES = new Set(['ready', 'offline', 'auth_required', 'error'])
 const NON_RETRYABLE_STATUS_CODES = new Set([400, 404, 409, 413])
+const RELAY_WORKSPACE_ID = `${PLUGIN_ID}:home`
 
 let pluginContext = null
+let relayWorkspaceClose = null
 
 function text(value, fallback = '') {
   return typeof value === 'string' ? value : fallback
@@ -181,6 +184,69 @@ function safeStorageSet(ctx, channelId) {
   } catch {
     // Selection is a convenience, never a prerequisite for Relay access.
   }
+}
+
+function closeRelayWorkspace() {
+  const close = relayWorkspaceClose
+
+  relayWorkspaceClose = null
+  if (typeof close === 'function') {
+    try {
+      close()
+    } catch {
+      // The workspace may already have been closed from its own tab.
+    }
+  }
+}
+
+function openRelayWorkspace() {
+  if (relayWorkspaceClose) {
+    return true
+  }
+
+  if (typeof host?.openWorkspace !== 'function') {
+    return false
+  }
+
+  try {
+    relayWorkspaceClose = host.openWorkspace(RELAY_WORKSPACE_ID, {
+      minWidth: '32rem',
+      onClose: () => {
+        relayWorkspaceClose = null
+      },
+      render: () => jsx(RelayPage, {}),
+      title: 'Relay'
+    })
+
+    return typeof relayWorkspaceClose === 'function'
+  } catch {
+    relayWorkspaceClose = null
+    return false
+  }
+}
+
+function openRelaySurface() {
+  if (openRelayWorkspace()) {
+    return
+  }
+
+  try {
+    host.navigate(RELAY_ROUTE)
+  } catch {
+    // Older shells without the main-workspace door keep the in-pane button.
+  }
+}
+
+function RelayPane() {
+  return jsx('section', {
+    'aria-label': 'Relay workspace launcher',
+    className: 'flex h-full min-h-0 flex-col px-3 py-4 text-(--ui-text-primary)',
+    children: jsx(EmptyState, {
+      action: jsx(Button, { onClick: openRelaySurface, size: 'sm', type: 'button', children: 'Open Relay' }),
+      description: 'Channels, transcripts, and messaging live in their own workspace.',
+      title: 'Relay channels'
+    })
+  })
 }
 
 function ConnectionBanner({ connection, onAuthorize, onRetry, pending }) {
@@ -690,6 +756,8 @@ export default {
   name: 'Relay',
   register(ctx) {
     pluginContext = ctx
+    relayWorkspaceClose = null
+
     ctx.registerMany([
       {
         area: ROUTES_AREA,
@@ -698,11 +766,52 @@ export default {
         render: () => jsx(RelayPage, {})
       },
       {
-        area: SIDEBAR_NAV_AREA,
-        data: { codicon: 'comment-discussion', label: 'Relay', path: RELAY_ROUTE },
-        id: 'nav',
-        order: 55
+        area: 'panes',
+        data: {
+          collapsible: true,
+          dock: { enforce: true, pane: 'sessions', pos: 'center' },
+          hideOnly: true,
+          placement: 'left',
+          width: '260px'
+        },
+        id: 'pane',
+        render: () => jsx(RelayPane, {}),
+        title: 'Relay'
       }
     ])
+
+    let stopVisibility = null
+
+    try {
+      const visibility = typeof host?.paneVisibility === 'function'
+        ? host.paneVisibility(`${PLUGIN_ID}:pane`)
+        : null
+      const syncWorkspace = visible => {
+        if (visible) {
+          openRelaySurface()
+        } else {
+          closeRelayWorkspace()
+        }
+      }
+
+      if (visibility && typeof visibility.get === 'function') {
+        syncWorkspace(visibility.get())
+      }
+      if (visibility && typeof visibility.listen === 'function') {
+        stopVisibility = visibility.listen(syncWorkspace)
+      }
+    } catch {
+      // Older Desktop builds still expose the pane's explicit Open button.
+    }
+
+    if (typeof ctx.onDispose === 'function') {
+      ctx.onDispose(() => {
+        stopVisibility?.()
+        closeRelayWorkspace()
+        if (pluginContext === ctx) {
+          pluginContext = null
+        }
+      })
+    }
   }
 }

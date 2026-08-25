@@ -76,7 +76,7 @@ def install_actor_lane(api_module, handler, *, actor_token=None, grant=None):
     from hermes_plugin_relay.relay_proxy import ActorLaneClient
 
     transport = RecordingTransport(handler)
-    lane = ActorLaneClient(actor_token=actor_token, grant=grant, transport=transport)
+    lane = ActorLaneClient(actor_token=actor_token, grant=grant, transport=transport, token_file=None)
     api_module._proxy_mod.reset_actor_lane_for_tests(lane)
     return transport
 

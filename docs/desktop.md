@@ -18,7 +18,7 @@ middleware.
 
 A second sidebar surface, **Harnesses**, is a read-only inspector over the
 native coding-agent sessions Relay already tracks (Claude Code, Codex, Pi,
-Prime Agent, plus Hermes/OpenCode rows when Relay reports them). Harnesses
+Prime Agent, DeepSeek Harness, Antigravity, plus Hermes/OpenCode rows when Relay reports them). Harnesses
 render as collapsible groups with an install-status dot, session count, and
 optional version; expanding an installed group loads that provider's native
 session summaries (newest first), and selecting one shows a bounded, redacted
@@ -94,10 +94,16 @@ The harness-session surface uses a second, independent credential family.
 (`relay-sac-v1…`) with `session:read`; otherwise `RELAY_IDE_ACTOR_GRANT`
 supplies a one-time handshake grant that is redeemed (once) for
 audience `relay:cli-gateway:v1`, capability `session:read`, and the standard
-read task-ref scope. The two lanes never share tokens: channels stay on the
+read task-ref scope. If neither is set, the plugin reads the
+`relay-ide login` credential file at `~/.config/relay-ide/actor-token.json`
+(#1435) — so a machine that already ran `relay-ide login` works with zero
+plugin configuration. Token precedence: env `RELAY_IDE_ACTOR_TOKEN` > grant >
+login file. The two lanes never share tokens: channels stay on the
 operator-client credential and native sessions on the actor credential, so a
 compromise or failure of one cannot widen into the other. Actor tokens obey the
-same in-process-only, 15-minute-ceiling, cleared-on-401/403 rules.
+same in-process-only, cleared-on-401/403 rules, and are auto-renewed ~2 min
+before expiry via `POST /cli-gateway/actor-credentials/renew` (the predecessor
+is never revoked, so a lost renew response can't lock the plugin out).
 
 Neither token nor grant is ever returned to Desktop JavaScript, included in a
 URL, written to config/files, placed in test fixtures, or logged by this

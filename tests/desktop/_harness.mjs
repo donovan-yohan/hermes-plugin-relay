@@ -328,7 +328,8 @@ export async function loadRelay({
           { provider: 'opencode', sessionCount: 0, status: 'unavailable' },
           { provider: 'pi', sessionCount: 0, status: 'unsupported' },
           { provider: 'prime-agent', sessionCount: 0, status: 'unsupported' },
-          { provider: 'dsh', sessionCount: 0, status: 'unsupported' }
+          { provider: 'dsh', sessionCount: 0, status: 'unsupported' },
+          { provider: 'antigravity', sessionCount: 0, status: 'unsupported' }
         ] }
       }
       const harnessSession = path.match(/^\/harnesses\/([a-z-]+)\/sessions\/([^/]+)$/)

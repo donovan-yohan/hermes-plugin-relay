@@ -38,7 +38,7 @@ malformed, missing-channel, and upstream-error states separately. The hidden
 `/relay` route remains available for deep links and older Desktop builds.
 
 The sidebar's **Harnesses** switch shows every native coding-agent harness the
-hub tracks — Claude Code, Codex, Pi, Prime Agent, DeepSeek Harness, plus
+hub tracks — Claude Code, Codex, Pi, Prime Agent, DeepSeek Harness, Antigravity, plus
 Hermes/OpenCode rows when supported — as collapsible groups with install
 status and session counts.
 Expanding an installed group lists that harness's native sessions newest-first;

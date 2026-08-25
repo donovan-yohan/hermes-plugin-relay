@@ -18,7 +18,7 @@ middleware.
 
 A second sidebar surface, **Harnesses**, is a read-only inspector over the
 native coding-agent sessions Relay already tracks (Claude Code, Codex, Pi,
-Prime Agent, plus Hermes/OpenCode rows when Relay reports them). Harnesses
+Prime Agent, DeepSeek Harness, Antigravity, plus Hermes/OpenCode rows when Relay reports them). Harnesses
 render as collapsible groups with an install-status dot, session count, and
 optional version; expanding an installed group loads that provider's native
 session summaries (newest first), and selecting one shows a bounded, redacted

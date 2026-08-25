@@ -42,7 +42,7 @@ OPERATOR_CLIENT_METADATA = {
     "platform": "linux",
 }
 ACTOR_CLIENT_ID = "desktop-plugin-harness-view"
-NATIVE_PROVIDERS = ("claude", "codex", "hermes", "opencode", "pi", "prime-agent", "dsh")
+NATIVE_PROVIDERS = ("claude", "codex", "hermes", "opencode", "pi", "prime-agent", "dsh", "antigravity")
 MAX_HARNESS_SESSIONS = 200
 MAX_SESSION_ID_BYTES = 512
 # `relay-ide login` (#1435) stores the scoped actor credential at this path with

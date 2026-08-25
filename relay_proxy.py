@@ -827,12 +827,12 @@ class ActorLaneClient:
             return None, None
         return token, deadline
 
-    def _renew(self, token: str) -> ConnectionStatus:
+    def _renew_locked(self, token: str) -> None:
         """Renew a still-valid token ~2 min before expiry (#1435).
 
-        The hub mints a successor with the same actor/capabilities/scope and
-        does NOT revoke the predecessor, so a lost response can't lock us out.
-        Single-flight: only one renew per process at a time.
+        Caller MUST hold ``self._lock``. The hub mints a successor with the
+        same actor/capabilities/scope and does NOT revoke the predecessor,
+        so a lost response can't lock us out.
         """
 
         renew_body = json.dumps(
@@ -846,29 +846,28 @@ class ActorLaneClient:
             body=renew_body,
         )
         if response.status_code < 200 or response.status_code >= 300:
-            # Renewal failed — the old token keeps working until it truly
-            # expires, then the next request fails closed with auth_required.
-            return ConnectionStatus("ready")
+            return
         issued = _mapping(response.payload)
         new_token = issued.get("token")
         if not isinstance(new_token, str) or not new_token.startswith("relay-sac-v1."):
-            return ConnectionStatus("ready")
+            return
         new_credential = _mapping(issued.get("credential"))
         expires_at = new_credential.get("expiresAt")
         new_deadline = None
         if isinstance(expires_at, str):
             try:
-                new_deadline = datetime.fromisoformat(
+                wall_deadline = datetime.fromisoformat(
                     expires_at.replace("Z", "+00:00")
                 ).timestamp()
+                # Convert wall-clock expiry to the monotonic domain so every
+                # consumer of _issued_deadline can compare against _clock().
+                new_deadline = self._clock() + max(0, wall_deadline - time.time())
             except ValueError:
                 pass
         if new_deadline is None:
             new_deadline = self._clock() + ACTOR_CREDENTIAL_TTL_MS / 1000
-        with self._lock:
-            self._issued_token = new_token
-            self._issued_deadline = new_deadline
-        return ConnectionStatus("ready")
+        self._issued_token = new_token
+        self._issued_deadline = new_deadline
 
     def _active_token(self) -> str | None:
         with self._lock:
@@ -899,6 +898,9 @@ class ActorLaneClient:
             ):
                 self._file_token = None
                 self._file_deadline = None
+                # Allow a re-read: the operator may have run
+                # `relay-ide login` again while the old file token was live.
+                self._file_checked = False
             return self._issued_token or self._configured_token or self._file_token
 
     def _clear_issued_token(self, token: str) -> None:
@@ -962,28 +964,30 @@ class ActorLaneClient:
         raise RelayUpstreamError(response.status_code)
 
     def _maybe_renew(self, token: str) -> None:
-        """Renew if the active token is within the margin of expiry."""
+        """Renew if the active token is within the margin of expiry.
+
+        Single-flight: the lock is held across the margin check AND the
+        renew I/O so two concurrent poll threads can't both pass the check
+        and mint duplicate successors.
+        """
 
         with self._lock:
-            deadline = None
             if token == self._issued_token and self._issued_deadline is not None:
-                deadline = self._issued_deadline
-                remaining = deadline - self._clock()
+                remaining = self._issued_deadline - self._clock()
             elif token == self._file_token and self._file_deadline is not None:
-                deadline = self._file_deadline
-                remaining = deadline - time.time()
+                remaining = self._file_deadline - time.time()
             elif token == self._configured_token and self._configured_deadline is not None:
-                deadline = self._configured_deadline
-                remaining = deadline - self._clock()
+                remaining = self._configured_deadline - self._clock()
             else:
                 return
             if remaining > ACTOR_RENEW_MARGIN_SECONDS:
                 return
-        try:
-            self._renew(token)
-        except (RelayUnavailableError, RelayUpstreamError, RelayMalformedResponseError):
-            # Renewal failed; the old token keeps working until real expiry.
-            pass
+            # Hold the lock through the I/O so a concurrent caller
+            # sees the renewed token and skips its own renew.
+            try:
+                self._renew_locked(token)
+            except (RelayUnavailableError, RelayUpstreamError, RelayMalformedResponseError):
+                pass
 
     def authorize(self) -> ConnectionStatus:
         """Redeem at most one grant; the returned token never leaves here.

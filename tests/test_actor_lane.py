@@ -413,16 +413,24 @@ def test_renewal_fires_before_expiry_and_swaps_token():
     clock = [100.0]
     original_token = "relay-sac-v1.original"
     renewed_token = "relay-sac-v1.renewed"
+    renewed_token_2 = "relay-sac-v1.renewed-2"
     renew_path = "/cli-gateway/actor-credentials/renew"
+    renew_count = [0]
 
     def handler(**call):
         if call["url"].endswith(renew_path):
+            renew_count[0] += 1
             assert call["headers"]["x-relay-cli-command"] == "actor-credentials.renew"
+            token = renewed_token if renew_count[0] == 1 else renewed_token_2
+            # Future deadline so the renewed token survives long enough
+            # for the first request; the second renewal is forced by
+            # manipulating _issued_deadline directly.
+            expires = "2099-01-01T00:00:00.000Z"
             return RelayHttpResponse(
                 201,
                 {
-                    "token": renewed_token,
-                    "credential": {"id": "sac:renewed", "expiresAt": "2099-01-01T00:00:00.000Z"},
+                    "token": token,
+                    "credential": {"id": f"sac:{renew_count[0]}", "expiresAt": expires},
                 },
             )
         return RelayHttpResponse(200, harness_report())
@@ -440,6 +448,16 @@ def test_renewal_fires_before_expiry_and_swaps_token():
     # The native-list call used the renewed token.
     list_calls = [c for c in transport.calls if c["url"].endswith("/sessions/native")]
     assert list_calls[0]["headers"]["Authorization"] == f"Bearer {renewed_token}"
+
+    # Advance past the renewed token's deadline so a second renewal fires.
+    with lane._lock:
+        lane._issued_deadline = clock[0] + 30  # < 120s margin
+    lane.harnesses()
+    renew_calls = [c for c in transport.calls if c["url"].endswith(renew_path)]
+    assert len(renew_calls) == 2, "second renewal must fire after first renewed token nears expiry"
+    assert renew_calls[1]["headers"]["Authorization"] == f"Bearer {renewed_token}"
+    list_calls = [c for c in transport.calls if c["url"].endswith("/sessions/native")]
+    assert list_calls[1]["headers"]["Authorization"] == f"Bearer {renewed_token_2}"
 
 
 def test_renewal_failure_keeps_old_token_working():

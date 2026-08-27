@@ -92,6 +92,7 @@ streaming.
 See [docs/desktop.md](docs/desktop.md) for the frozen API. In short:
 
 - `GET /connection/status`
+- `GET /connection/onboarding` — returns only the validated loopback Relay root as `{ "url": "..." }` so Desktop can open setup without exposing grants or credentials
 - `POST /connection/authorize`
 - `GET /channels`
 - `GET /channels/:id/messages?limit=50`

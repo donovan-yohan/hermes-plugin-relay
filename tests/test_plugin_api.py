@@ -65,9 +65,16 @@ def client(api_module):
         yield test_client
 
 
-def install_proxy(api_module, handler, *, credential="configured-value", grant=None):
+def install_proxy(
+    api_module,
+    handler,
+    *,
+    base_url: str = "http://127.0.0.1:3456",
+    credential: str | None = "configured-value",
+    grant: str | None = None,
+):
     transport = RecordingTransport(handler)
-    proxy = RelayProxy(credential=credential, grant=grant, transport=transport)
+    proxy = RelayProxy(base_url=base_url, credential=credential, grant=grant, transport=transport)
     api_module._proxy_mod.reset_relay_proxy_for_tests(proxy)
     return transport
 
@@ -168,6 +175,20 @@ def test_authorize_without_a_grant_is_honestly_auth_required(client, api_module)
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "auth_required"
     assert transport.calls == []
+
+
+def test_connection_onboarding_returns_only_the_configured_relay_root(client, api_module):
+    install_proxy(
+        api_module,
+        lambda **_call: pytest.fail("must not call Relay"),
+        base_url="http://[::1]:4567",
+        credential=None,
+    )
+
+    response = client.get(f"{PREFIX}/connection/onboarding")
+
+    assert response.status_code == 200
+    assert response.json() == {"url": "http://[::1]:4567/"}
 
 
 @pytest.mark.parametrize(

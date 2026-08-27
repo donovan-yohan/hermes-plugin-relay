@@ -643,6 +643,11 @@ class RelayProxy:
             return ConnectionStatus("error", "Relay returned an invalid response")
         return ConnectionStatus("ready")
 
+    def onboarding_url(self) -> str:
+        if self._configuration_error:
+            raise RelayConfigurationError()
+        return f"{self._base_url}/"
+
     def authorize(self) -> ConnectionStatus:
         """Redeem at most one grant; the returned token never leaves this object."""
 

@@ -83,6 +83,50 @@ test('401 and 403 move the page into the authorization state and post only to th
   }
 })
 
+test('a missing grant opens Relay and explains how authorization completes', async () => {
+  const relay = await loadRelay({
+    rest: async path => {
+      if (path === '/connection/status') return { status: 'auth_required' }
+      if (path === '/connection/authorize') throw responseError(401, 'grant required')
+      if (path === '/connection/onboarding') return { url: 'http://127.0.0.1:3456/' }
+      throw new Error(`unexpected ${path}`)
+    }
+  })
+  const app = relay.mount()
+
+  await app.settle()
+  findButton(app.tree, 'Authorize Relay').props.onClick()
+  await app.settle()
+
+  assert.deepStrictEqual(relay.externalUrls, ['http://127.0.0.1:3456/'])
+  assert.match(textContent(app.tree), /approved scoped grant/)
+  assert.match(textContent(app.tree), /restart Hermes/)
+})
+
+test('failed Relay launch keeps the grant and restart recovery instructions', async () => {
+  const relay = await loadRelay({
+    openExternal: async () => {
+      throw new Error('shell denied launch')
+    },
+    rest: async path => {
+      if (path === '/connection/status') return { status: 'auth_required' }
+      if (path === '/connection/authorize') throw responseError(401, 'grant required')
+      if (path === '/connection/onboarding') return { url: 'http://127.0.0.1:3456/' }
+      throw new Error(`unexpected ${path}`)
+    }
+  })
+  const app = relay.mount()
+
+  await app.settle()
+  findButton(app.tree, 'Authorize Relay').props.onClick()
+  await app.settle()
+
+  assert.strictEqual(findAll(app.tree, node => node.props?.['data-connection'] === 'auth_required').length, 1)
+  assert.match(textContent(app.tree), /approved scoped grant/)
+  assert.match(textContent(app.tree), /restart Hermes/)
+  assert.match(textContent(app.tree), /could not be opened/)
+})
+
 test('offline refresh preserves the stale transcript read-only and keeps the draft', async () => {
   let statusChecks = 0
   const relay = await loadRelay({

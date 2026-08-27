@@ -203,6 +203,7 @@ function createRenderer(rootElement, hooks) {
 export async function loadRelay({
   channels = [{ id: 'general', name: 'General', summary: 'The main Relay channel' }],
   histories = { general: { messages: [] } },
+  openExternal,
   post,
   rest,
   status = { status: 'ready' },
@@ -210,6 +211,7 @@ export async function loadRelay({
   workspaceSupported = true
 } = {}) {
   const calls = []
+  const externalUrls = []
   const registrations = []
   const socketHandlers = []
   const storage = { get: [], set: [] }
@@ -292,6 +294,12 @@ export async function loadRelay({
   const plugin = module.default
 
   const ctx = {
+    os: {
+      openExternal: async url => {
+        externalUrls.push(url)
+        return openExternal ? openExternal(url) : true
+      }
+    },
     onDispose: dispose => pluginDisposers.push(dispose),
     registerMany: contributions => {
       registrations.push(...contributions)
@@ -422,6 +430,7 @@ export async function loadRelay({
         dispose()
       }
     },
+    externalUrls,
     histories: () => calls.filter(call => call.path.includes('/messages?limit=50')),
     mount,
     navigations,

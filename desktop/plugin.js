@@ -384,7 +384,7 @@ function ConnectionBanner({ connection, onAuthorize, onRetry, pending }) {
   const copy = {
     auth_required: {
       action: 'Authorize Relay',
-      body: 'Relay needs authorization before channels can be updated.',
+      body: connection.message || 'Relay needs authorization before channels can be updated.',
       title: 'Authorization required'
     },
     error: {
@@ -905,7 +905,27 @@ function RelayPage() {
       await ctx.rest('/connection/authorize', { method: 'POST' })
       await refreshPage()
     } catch (error) {
-      if (!noteAuthRequired(error)) {
+      if (isAuthError(error)) {
+        noteAuthRequired(error)
+        try {
+          const onboarding = await ctx.rest('/connection/onboarding')
+          const opened = typeof onboarding?.url === 'string'
+            && typeof ctx?.os?.openExternal === 'function'
+            && await ctx.os.openExternal(onboarding.url)
+
+          setConnection({
+            message: opened
+              ? 'Relay opened in your browser. Supply an approved scoped grant when starting Hermes, then restart Hermes and authorize again.'
+              : 'Supply an approved scoped grant when starting Hermes, then restart Hermes and authorize again.',
+            status: 'auth_required'
+          })
+        } catch (onboardingError) {
+          setConnection({
+            message: `Relay could not be opened. Supply an approved scoped grant when starting Hermes, then restart Hermes and authorize again. ${errorMessage(onboardingError, '')}`.trim(),
+            status: 'auth_required'
+          })
+        }
+      } else {
         setConnection({ message: errorMessage(error, 'Relay authorization could not be started.'), status: 'error' })
       }
     } finally {

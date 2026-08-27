@@ -32,6 +32,7 @@ stream.
 ## Frozen endpoints
 
 - `GET /connection/status` → `{ "status": "ready" | "offline" | "auth_required" | "error", "message"?: string }`
+- `GET /connection/onboarding` → `{ "url": "http://<literal-loopback>[:port]/" }` (credential-free setup target)
 - `POST /connection/authorize`
 - `GET /channels`
 - `GET /channels/:id/messages?limit=50` (1–50 only)

@@ -218,6 +218,14 @@ async def connection_status() -> Any:
     return (await run_in_threadpool(_proxy().status)).to_wire()
 
 
+@router.get("/connection/onboarding")
+async def connection_onboarding() -> Any:
+    try:
+        return {"url": await run_in_threadpool(_proxy().onboarding_url)}
+    except RelayProxyError as error:
+        return _relay_error(error)
+
+
 @router.post("/connection/authorize")
 async def connection_authorize(request: Request) -> Any:
     try:

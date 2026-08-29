@@ -9,6 +9,8 @@ from conftest import RecordingTransport
 from hermes_plugin_relay.relay_proxy import (
     ACTOR_AUDIENCE,
     ACTOR_CREDENTIAL_TTL_MS,
+    ACTOR_PROBE_COMMAND,
+    ACTOR_PROBE_PATH,
     ACTOR_READ_TASK_REF,
     ActorLaneClient,
     RelayAuthRequiredError,
@@ -16,12 +18,17 @@ from hermes_plugin_relay.relay_proxy import (
     RelayHttpResponse,
     RelayMalformedResponseError,
     project_harness_rows,
+    project_lane_probe,
     project_native_session_snapshot,
     project_native_session_summaries,
 )
 
 ACTOR_ISSUE_PATH = "/cli-gateway/actor-credentials"
 NATIVE_LIST_PATH = "/sessions/native"
+
+
+def probe_ok(**_call):
+    return RelayHttpResponse(200, {"nodes": []})
 
 
 def provider_status(provider: str, status: str, version: str | None = None) -> dict:
@@ -348,12 +355,81 @@ def test_actor_status_is_independent_and_does_not_dial_without_a_token():
     }
     assert missing_transport.calls == []
 
-    ready, ready_transport = make_lane(
-        lambda **_call: RelayHttpResponse(200, harness_report()),
+    ready, ready_transport = make_lane(probe_ok, actor_token="configured-sac")
+    assert ready.status().to_wire() == {"status": "ready"}
+    assert ready_transport.calls[0]["url"].endswith(ACTOR_PROBE_PATH)
+
+
+def test_status_probes_the_lane_without_listing_native_sessions():
+    """The status check must not make the hub walk every provider state root.
+
+    Listing native sessions is unbounded in the operator's harness history —
+    it is a filesystem walk over every provider's state root — and this check
+    fires on mount and on every explicit refresh. The probe reads the same
+    credential lane through the same scoped-actor middleware and the same
+    `session:read` capability, but answers from the hub's in-memory registry.
+    """
+
+    def handler(**call):
+        if call["url"].endswith(NATIVE_LIST_PATH):
+            return pytest.fail("a status check must never list native sessions")
+        assert call["url"].endswith(ACTOR_PROBE_PATH)
+        assert call["method"] == "GET"
+        assert call["headers"]["x-relay-cli-command"] == ACTOR_PROBE_COMMAND
+        assert call["body"] is None
+        return probe_ok()
+
+    lane, transport = make_lane(handler, actor_token="configured-sac")
+
+    assert lane.status().to_wire() == {"status": "ready"}
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("probe_status", "probe_payload", "expected"),
+    [
+        (401, {}, {"status": "auth_required", "message": "Harness authorization is required"}),
+        (403, {}, {"status": "auth_required", "message": "Harness authorization is required"}),
+        (503, {}, {"status": "offline", "message": "Relay is unavailable"}),
+        (400, {}, {"status": "error", "message": "Relay returned an invalid response"}),
+        # A 200 that is not the node-list contract is a hub speaking something
+        # else, not a healthy lane.
+        (200, {"sessions": [], "providers": []}, {"status": "error", "message": "Relay returned an invalid response"}),
+        (200, {"nodes": "not-a-list"}, {"status": "error", "message": "Relay returned an invalid response"}),
+    ],
+)
+def test_status_maps_every_probe_outcome_to_its_own_lane_state(
+    probe_status, probe_payload, expected
+):
+    lane, _transport = make_lane(
+        lambda **_call: RelayHttpResponse(probe_status, probe_payload),
         actor_token="configured-sac",
     )
-    assert ready.status().to_wire() == {"status": "ready"}
-    assert ready_transport.calls[0]["url"].endswith(NATIVE_LIST_PATH)
+
+    assert lane.status().to_wire() == expected
+
+
+def test_harness_rows_still_come_from_the_native_listing():
+    """The probe replaces the status dial only; the harness surface is unchanged."""
+
+    def handler(**call):
+        if call["url"].endswith(NATIVE_LIST_PATH):
+            return RelayHttpResponse(200, harness_report())
+        return pytest.fail(f"unexpected Relay call: {call['url']}")
+
+    lane, transport = make_lane(handler, actor_token="configured-sac")
+
+    rows = lane.harnesses()
+    assert [row["provider"] for row in rows] == ["claude", "codex", "hermes", "opencode"]
+    assert transport.calls[0]["headers"]["x-relay-cli-command"] == "sessions.native.list"
+
+
+def test_lane_probe_projection_keeps_nothing_and_rejects_other_shapes():
+    assert project_lane_probe({"nodes": []}) is None
+    assert project_lane_probe({"nodes": [{"nodeId": "n1"}]}) is None
+    for payload in ({}, {"nodes": None}, {"nodes": {}}, [], "nodes", None):
+        with pytest.raises(RelayMalformedResponseError):
+            project_lane_probe(payload)
 
 
 def test_browser_login_projects_public_fields_and_captures_token_exactly_once():
@@ -734,7 +810,7 @@ def test_a_hub_rejected_env_token_does_not_wedge_relay_login():
 
     def handler(**call):
         nonlocal starts
-        if call["url"].endswith(NATIVE_LIST_PATH):
+        if call["url"].endswith(ACTOR_PROBE_PATH):
             return RelayHttpResponse(401, {})
         if call["url"].endswith(LOGIN_START_PATH):
             starts += 1

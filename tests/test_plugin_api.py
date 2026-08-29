@@ -110,8 +110,10 @@ def test_status_and_channel_routes_use_only_safe_projected_data(client, api_modu
     def handler(**call):
         if call["url"].endswith("/channels"):
             return RelayHttpResponse(200, channel_list())
+        if call["url"].endswith("/nodes"):
+            return RelayHttpResponse(200, {"nodes": []})
         if call["url"].endswith("/sessions/native"):
-            return RelayHttpResponse(200, {"sessions": [], "providers": []})
+            return pytest.fail("a status check must not list native sessions")
         if call["method"] == "GET":
             return RelayHttpResponse(200, {"messages": [message()]})
         return RelayHttpResponse(201, {"message": message(), "run": {"id": "chrun:not-for-desktop"}})
@@ -154,9 +156,9 @@ def test_connection_status_keeps_channel_and_harness_auth_independent(client, ap
         lambda **_call: pytest.fail("an unconfigured channel lane must not dial"),
         credential=None,
     )
-    install_actor_lane(
+    harness_transport = install_actor_lane(
         api_module,
-        lambda **_call: RelayHttpResponse(200, {"sessions": [], "providers": []}),
+        lambda **_call: RelayHttpResponse(200, {"nodes": []}),
         actor_token="configured-sac",
     )
     response = client.get(f"{PREFIX}/connection/status")
@@ -170,6 +172,11 @@ def test_connection_status_keeps_channel_and_harness_auth_independent(client, ap
         "harnesses": {"status": "ready", "loginAvailable": True},
     }
     assert channel_transport.calls == []
+    # The harness lane proves itself with the cheap node read, never by making
+    # the hub walk every provider state root behind the mount.
+    assert [call["url"] for call in harness_transport.calls] == [
+        "http://127.0.0.1:3456/nodes"
+    ]
 
     install_proxy(
         api_module,

@@ -53,6 +53,15 @@ RELAY_ACTOR_TOKEN_FILE = os.path.expanduser("~/.config/relay-ide/actor-token.jso
 # Renew when <120s remain, matching the CLI's own threshold.
 ACTOR_RENEW_MARGIN_SECONDS = 120
 ACTOR_RENEW_COMMAND = "actor-credentials.renew"
+# Liveness probe for the read-only actor lane. `nodes.list` sits on the same
+# hub read-command allowlist as `sessions.native.list`, resolves to the same
+# `session:read` capability, and passes through the identical scoped-actor
+# middleware, so it proves exactly what a status check needs: this hub is
+# reachable and this credential is still accepted on this lane. Unlike the
+# native-session list it answers from an in-memory node registry instead of
+# walking every harness state root on disk.
+ACTOR_PROBE_COMMAND = "nodes.list"
+ACTOR_PROBE_PATH = "/nodes"
 ACTOR_FILE_RECHECK_SECONDS = 5
 ACTOR_LOGIN_DISPLAY_NAME = "Relay desktop plugin"
 ACTOR_LOGIN_CAPABILITIES = ("session:read",)
@@ -441,6 +450,20 @@ def _project_preview(block: Any) -> tuple[str, bool]:
     text_value = block.get("text")
     preview = text_value if isinstance(text_value, str) else ""
     return preview, block.get("redacted") is True
+
+
+def project_lane_probe(payload: Any) -> None:
+    """Validate the actor-lane liveness probe without retaining any of it.
+
+    The probe exists to answer "is this lane live?", so nothing is projected
+    back to the renderer. The shape is still checked: a 200 carrying something
+    other than a node list means the hub is not speaking this contract, which
+    is an error rather than a healthy lane.
+    """
+
+    data = _mapping(payload)
+    if not isinstance(data.get("nodes"), list):
+        raise RelayMalformedResponseError()
 
 
 def project_harness_rows(payload: Any) -> list[dict[str, Any]]:
@@ -1155,7 +1178,13 @@ class ActorLaneClient:
         return ConnectionStatus("ready")
 
     def status(self) -> ConnectionStatus:
-        """Probe only the read-only harness lane with its own credential."""
+        """Probe only the read-only harness lane with its own credential.
+
+        The probe is deliberately not the harness listing: that call makes the
+        hub walk every provider's state root on disk, which is unbounded in the
+        operator's session history and blocks the surface that fires this check
+        on mount. `_probe_lane` reads the same lane far more cheaply.
+        """
 
         if self._configuration_error:
             return ConnectionStatus("error", "Relay URL is invalid")
@@ -1164,7 +1193,7 @@ class ActorLaneClient:
                 return ConnectionStatus("error", "Relay public approval URL is invalid")
             return ConnectionStatus("auth_required", "Harness authorization is required")
         try:
-            self.harnesses()
+            self._probe_lane()
         except RelayAuthRequiredError:
             return ConnectionStatus("auth_required", "Harness authorization is required")
         except (RelayUnavailableError, RelayResponseTooLargeError):
@@ -1328,6 +1357,15 @@ class ActorLaneClient:
             self._login_flow = None
         return {"status": "ready" if self._usable_token() is not None else "idle"}
 
+    def _probe_lane(self) -> None:
+        """Cheapest allowlisted read that still proves this credential works."""
+
+        project_lane_probe(
+            self._actor_request(
+                command=ACTOR_PROBE_COMMAND, method="GET", path=ACTOR_PROBE_PATH
+            )
+        )
+
     def harnesses(self) -> list[dict[str, Any]]:
         """Per-harness install rows with live session counts, hub-ordered."""
 
@@ -1420,6 +1458,8 @@ __all__ = [
     "ACTOR_CLIENT_ID",
     "ACTOR_LOGIN_CAPABILITIES",
     "ACTOR_LOGIN_DISPLAY_NAME",
+    "ACTOR_PROBE_COMMAND",
+    "ACTOR_PROBE_PATH",
     "ACTOR_READ_TASK_REF",
     "ACTOR_RENEW_COMMAND",
     "ACTOR_RENEW_MARGIN_SECONDS",
@@ -1456,6 +1496,7 @@ __all__ = [
     "project_channel",
     "project_channels",
     "project_harness_rows",
+    "project_lane_probe",
     "project_history",
     "project_message",
     "project_native_session_snapshot",

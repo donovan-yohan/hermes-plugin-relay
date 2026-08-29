@@ -311,6 +311,8 @@ def test_harness_login_routes_never_return_the_approved_token(client, api_module
                     "token": secret,
                     "credential": {
                         "id": "sac:private-record",
+                        "audience": "relay:cli-gateway:v1",
+                        "capabilities": ["session:read"],
                         "expiresAt": "2099-01-01T00:00:00.000Z",
                     },
                 },
@@ -322,7 +324,7 @@ def test_harness_login_routes_never_return_the_approved_token(client, api_module
     transport = install_actor_lane(
         api_module,
         handler,
-        public_url="http://dev.example.test:3456",
+        public_url="https://dev.example.test",
     )
     started = client.post(f"{PREFIX}/harnesses/login/start")
     assert started.status_code == 200
@@ -331,9 +333,12 @@ def test_harness_login_routes_never_return_the_approved_token(client, api_module
         "code": "Q7CV-EH8Y",
         "expiresAt": "2099-01-01T00:00:00.000Z",
         "verificationUrl": (
-            f"http://dev.example.test:3456/cli-gateway/login/{flow_id}/approve"
+            f"https://dev.example.test/cli-gateway/login/{flow_id}/approve"
         ),
     }
+    # The browser-visible root is display-only: assert the exact request origin,
+    # since an `endswith` check would pass for either base URL.
+    assert transport.calls[0]["url"] == "http://127.0.0.1:3456/cli-gateway/login/start"
     assert json.loads(transport.calls[0]["body"]) == {
         "actorId": "desktop-plugin-harness-view",
         "displayName": "Relay desktop plugin",
@@ -354,6 +359,9 @@ def test_harness_login_routes_never_return_the_approved_token(client, api_module
     harnesses = client.get(f"{PREFIX}/harnesses")
     assert harnesses.status_code == 200
     assert transport.calls[-1]["headers"]["Authorization"] == f"Bearer {secret}"
+    assert all(
+        call["url"].startswith("http://127.0.0.1:3456/") for call in transport.calls
+    )
 
 
 def test_harness_login_rejects_bodies_and_cancel_forgets_the_flow(client, api_module):

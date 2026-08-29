@@ -72,12 +72,14 @@ Browser approval normally uses that same loopback origin. If Desktop is opened
 from another tailnet machine, set a separately validated, display-only origin:
 
 ```text
-RELAY_IDE_PUBLIC_URL=http://dev.example.ts.net:3456
+RELAY_IDE_PUBLIC_URL=https://dev.example.ts.net
 ```
 
-This value may be an HTTP or HTTPS root URL, but cannot contain credentials,
-path, query, or fragment. It is used only to build the browser approval link;
-credential-bearing backend requests still use the loopback-only
+This value must be an HTTPS root URL unless its host is a literal loopback
+address, because the approval link carries a one-time flow id that anyone who
+reads it in flight could redeem before this plugin does. It cannot contain
+credentials, path, query, or fragment, and is used only to build the browser
+approval link; credential-bearing backend requests still use the loopback-only
 `RELAY_IDE_URL`.
 
 Provide an existing Relay operator-client token only through the process

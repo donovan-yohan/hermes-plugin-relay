@@ -386,6 +386,8 @@ def test_browser_login_projects_public_fields_and_captures_token_exactly_once():
                     "token": secret,
                     "credential": {
                         "id": "sac:device",
+                        "audience": "relay:cli-gateway:v1",
+                        "capabilities": ["session:read"],
                         "expiresAt": "2099-01-01T00:00:00.000Z",
                     },
                 },
@@ -396,7 +398,7 @@ def test_browser_login_projects_public_fields_and_captures_token_exactly_once():
 
     lane, transport = make_lane(
         handler,
-        public_url="http://dev.example.test:3456",
+        public_url="https://dev.example.test",
     )
     started = lane.start_login()
     assert started == {
@@ -404,9 +406,12 @@ def test_browser_login_projects_public_fields_and_captures_token_exactly_once():
         "code": "ABCD-1234",
         "expiresAt": "2099-01-01T00:00:00.000Z",
         "verificationUrl": (
-            f"http://dev.example.test:3456/cli-gateway/login/{flow_id}/approve"
+            f"https://dev.example.test/cli-gateway/login/{flow_id}/approve"
         ),
     }
+    # The display-only public root must never carry a request: assert the exact
+    # origin, because a suffix match would pass for either base URL.
+    assert transport.calls[0]["url"] == "http://127.0.0.1:3456/cli-gateway/login/start"
     assert secret not in json.dumps(started)
     assert json.loads(transport.calls[0]["body"]) == {
         "actorId": "desktop-plugin-harness-view",
@@ -423,6 +428,9 @@ def test_browser_login_projects_public_fields_and_captures_token_exactly_once():
 
     lane.harnesses()
     assert transport.calls[-1]["headers"]["Authorization"] == f"Bearer {secret}"
+    assert all(
+        call["url"].startswith("http://127.0.0.1:3456/") for call in transport.calls
+    ), "every credential-bearing request stays on the loopback base URL"
 
 
 @pytest.mark.parametrize(
@@ -695,3 +703,128 @@ def test_renewal_rejects_naive_expiry_and_uses_bounded_fallback():
     lane.harnesses()
 
     assert lane._issued_deadline == clock[0] + ACTOR_CREDENTIAL_TTL_MS / 1000
+
+
+LOGIN_START_PATH = "/cli-gateway/login/start"
+
+
+def login_start_response(flow_id: str) -> RelayHttpResponse:
+    return RelayHttpResponse(
+        201,
+        {
+            "flowId": flow_id,
+            "code": "ABCD-1234",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "verificationUrl": (
+                f"http://127.0.0.1:3456/cli-gateway/login/{flow_id}/approve"
+            ),
+        },
+    )
+
+
+def test_a_hub_rejected_env_token_does_not_wedge_relay_login():
+    """A stale but unexpired env/file token must not block a fresh login.
+
+    `_actor_request` deliberately keeps operator-supplied tokens on 401/403, so
+    without lane-rejection tracking `start_login` would short-circuit to
+    "ready" forever while the lane stayed `auth_required`.
+    """
+
+    starts = 0
+
+    def handler(**call):
+        nonlocal starts
+        if call["url"].endswith(NATIVE_LIST_PATH):
+            return RelayHttpResponse(401, {})
+        if call["url"].endswith(LOGIN_START_PATH):
+            starts += 1
+            return login_start_response("11111111-2222-3333-4444-555555555555")
+        return pytest.fail(f"unexpected Relay call: {call['url']}")
+
+    lane, _transport = make_lane(handler, actor_token="relay-sac-v1.stale")
+
+    assert lane.status().to_wire() == {
+        "status": "auth_required",
+        "message": "Harness authorization is required",
+    }
+    started = lane.start_login()
+
+    assert started["status"] == "pending"
+    assert starts == 1, "the rejected lane must still be able to dial a login"
+
+
+def test_start_login_reuses_a_live_flow_instead_of_orphaning_hub_slots():
+    starts = 0
+
+    def handler(**call):
+        nonlocal starts
+        if call["url"].endswith(LOGIN_START_PATH):
+            starts += 1
+            return login_start_response("11111111-2222-3333-4444-555555555555")
+        return pytest.fail(f"unexpected Relay call: {call['url']}")
+
+    lane, _transport = make_lane(handler)
+    first = lane.start_login()
+
+    assert lane.start_login() == first
+    assert lane.start_login() == first
+    assert starts == 1, "Relay's pending-flow cap is not burned by repeat clicks"
+
+
+def test_a_widened_or_mis_audienced_login_credential_is_refused():
+    flow_id = "11111111-2222-3333-4444-555555555555"
+
+    def make_handler(credential):
+        def handler(**call):
+            if call["url"].endswith(LOGIN_START_PATH):
+                return login_start_response(flow_id)
+            if call["url"].endswith(f"/cli-gateway/login/{flow_id}"):
+                return RelayHttpResponse(
+                    200,
+                    {
+                        "status": "approved",
+                        "token": "relay-sac-v1.widened",
+                        "credential": credential,
+                    },
+                )
+            return pytest.fail(f"unexpected Relay call: {call['url']}")
+
+        return handler
+
+    good = {
+        "id": "sac:device",
+        "audience": ACTOR_AUDIENCE,
+        "capabilities": ["session:read"],
+        "expiresAt": "2099-01-01T00:00:00.000Z",
+    }
+    for credential in (
+        {**good, "capabilities": ["session:read", "session:write"]},
+        {**good, "capabilities": ["session:write"]},
+        {**good, "capabilities": []},
+        {**good, "audience": "relay:operator-client:v1"},
+        {key: value for key, value in good.items() if key != "capabilities"},
+    ):
+        lane, _transport = make_lane(make_handler(credential))
+        lane.start_login()
+        with pytest.raises(RelayMalformedResponseError):
+            lane.poll_login()
+        assert lane._active_token() is None, "a widened credential is never installed"
+
+    lane, _transport = make_lane(make_handler(good))
+    lane.start_login()
+    assert lane.poll_login() == {"status": "ready"}
+
+
+@pytest.mark.parametrize(
+    "flow_id",
+    ["..", ".", "a/b", "a b", "a?b", "a#b", "a%2fb", "", "x" * 129],
+)
+def test_a_hostile_flow_id_is_rejected_before_it_reaches_a_url(flow_id):
+    def handler(**call):
+        if call["url"].endswith(LOGIN_START_PATH):
+            return login_start_response(flow_id)
+        return pytest.fail(f"unexpected Relay call: {call['url']}")
+
+    lane, _transport = make_lane(handler)
+    with pytest.raises(RelayMalformedResponseError):
+        lane.start_login()

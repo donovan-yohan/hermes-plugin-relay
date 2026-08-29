@@ -111,7 +111,9 @@ def test_non_loopback_or_non_root_urls_are_rejected(url):
     ("url", "expected"),
     [
         ("https://relay.example.test", "https://relay.example.test"),
-        ("http://relay.example.test:3456/", "http://relay.example.test:3456"),
+        ("http://127.0.0.1:3456/", "http://127.0.0.1:3456"),
+        ("http://localhost:3456", "http://localhost:3456"),
+        ("http://[::1]:3456", "http://[::1]:3456"),
         ("https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443"),
     ],
 )
@@ -123,13 +125,23 @@ def test_public_approval_root_urls_are_canonicalized(url, expected):
     "url",
     [
         "ftp://relay.example.test",
+        "javascript:alert(1)",
+        "data:text/html,<script>alert(1)</script>",
+        # Plaintext to a remote host would expose the one-time approval flow id
+        # to anyone on the path; only literal loopback may skip TLS.
+        "http://relay.example.test:3456/",
+        "http://dev.example.ts.net:3456",
         "https://user@relay.example.test",
         "https://relay.example.test/approve",
         "https://relay.example.test?q=1",
         "https://relay.example.test#fragment",
         "https://relay.example.test\\@evil.example",
         "https://relay.example.test\n.evil.example",
+        "https://relay.example.test\t.evil.example",
         "https://relay.example.test:99999",
+        "https://relay.example.test:0",
+        "https://" + "a" * 4096 + ".example.test",
+        "https://relay.example.test\u202e",
     ],
 )
 def test_public_approval_urls_reject_ambiguous_or_non_root_values(url):

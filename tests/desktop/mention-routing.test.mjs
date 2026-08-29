@@ -108,7 +108,11 @@ test('a missing channel grant opens Relay and explains how authorization complet
   await app.settle()
 
   assert.deepStrictEqual(relay.externalUrls, ['http://127.0.0.1:3456/'])
-  assert.strictEqual(relay.calls.some(call => call.path === '/connection/authorize'), false, 'onboarding never redeems a grant from the renderer')
+  assert.strictEqual(
+    relay.calls.filter(call => call.path === '/connection/onboarding').length,
+    1,
+    'one click asks the backend for the setup target exactly once'
+  )
   const note = findAll(app.tree, node => node.props?.['data-channel-setup'] === 'true')[0]
 
   assert.ok(note, 'the channels lane explains how setup completes')
@@ -138,6 +142,48 @@ test('failed Relay launch keeps the grant and restart recovery instructions', as
   assert.match(textContent(note), /approved scoped grant/)
   assert.match(textContent(note), /restart Hermes/)
   assert.match(textContent(note), /could not be opened/)
+})
+
+test('the channel setup note clears once operator access recovers', async () => {
+  let authorized = false
+  const relay = await loadRelay({
+    rest: async path => {
+      if (path === '/connection/status') {
+        return {
+          channels: { guidance: 'Channels need an operator-client credential.', status: authorized ? 'ready' : 'auth_required' },
+          harnesses: { loginAvailable: true, status: 'ready' }
+        }
+      }
+      if (path === '/connection/onboarding') return { url: 'http://127.0.0.1:3456/' }
+      if (path === '/channels') return { channels: [{ id: 'general', name: 'General' }] }
+      if (path === '/channels/general/messages?limit=50') return { messages: [] }
+      if (path === '/harnesses') return { harnesses: [] }
+      throw new Error(`unexpected ${path}`)
+    }
+  })
+  const app = relay.mount()
+
+  await app.settle()
+  findButton(app.tree, 'Open Relay').props.onClick()
+  await app.settle()
+  assert.strictEqual(findAll(app.tree, node => node.props?.['data-channel-setup'] === 'true').length, 1)
+
+  authorized = true
+  findButton(app.tree, 'Refresh').props.onClick()
+  await app.settle()
+
+  // Going ready only HIDES the note, so the proof is the round trip: come back
+  // to auth_required and the stale hand-off text must be gone for good.
+  authorized = false
+  findButton(app.tree, 'Refresh').props.onClick()
+  await app.settle()
+
+  assert.strictEqual(
+    findAll(app.tree, node => node.props?.['data-channel-setup'] === 'true').length,
+    0,
+    'a stale browser hand-off note must not survive a recovery round trip'
+  )
+  assert.doesNotMatch(textContent(app.tree), /Relay opened in your browser/)
 })
 
 test('offline refresh preserves the stale transcript read-only and keeps the draft', async () => {

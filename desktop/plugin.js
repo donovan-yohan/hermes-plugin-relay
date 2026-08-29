@@ -595,7 +595,7 @@ function ConnectionPanel({ connections, login, loginPending, onCancelLogin, onCo
               }),
               showConnect
                 ? jsx(Button, {
-                    disabled: loginPending,
+                    disabled: pending || loginPending,
                     onClick: () => void onConnectHarnesses(),
                     size: 'xs',
                     type: 'button',
@@ -937,6 +937,9 @@ function RelayPage() {
   const sessionGeneration = useRef({})
   const detailGeneration = useRef(0)
   const loginPollInFlight = useRef(false)
+  const loginStatusRef = useRef(harnessLogin.status)
+
+  loginStatusRef.current = harnessLogin.status
 
   connectionRef.current = connection
   selectedRef.current = selectedChannelId
@@ -1040,7 +1043,9 @@ function RelayPage() {
       setConnections(status)
       if (status.harnesses.status === 'ready') {
         setHarnessLogin({ message: '', status: 'ready' })
-      } else if (status.harnesses.status === 'auth_required') {
+      } else if (status.harnesses.status === 'auth_required' && loginStatusRef.current !== 'pending') {
+        // A pending flow owns its own polling loop; a concurrent refresh must
+        // never overwrite the live code and approval link with a stale read.
         try {
           setHarnessLogin(normalizeHarnessLogin(await ctx.rest('/harnesses/login')))
         } catch (error) {
@@ -1051,6 +1056,10 @@ function RelayPage() {
       if (status.channels.status !== 'ready') {
         return
       }
+
+      // Channel access recovered: the setup note describes a browser hand-off
+      // that no longer applies.
+      setChannelSetup('')
 
       try {
         const nextChannels = normalizeChannels(await ctx.rest('/channels'))

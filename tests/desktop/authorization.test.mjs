@@ -156,11 +156,7 @@ test('invalid harness approval configuration is explained without a dead connect
   const relay = await loadRelay({
     status: {
       channels: { guidance: '', status: 'ready' },
-      harnesses: {
-        loginAvailable: false,
-        message: 'Relay public approval URL is invalid',
-        status: 'error'
-      }
+      harnesses: { loginAvailable: false, message: '', status: 'auth_required' }
     }
   })
   const app = relay.mount()
@@ -168,7 +164,10 @@ test('invalid harness approval configuration is explained without a dead connect
   await app.settle()
 
   const harnesses = findAll(app.tree, node => node.props?.['data-lane'] === 'harnesses')[0]
-  assert.match(textContent(harnesses), /Relay public approval URL is invalid/)
+
+  // `auth_required` + `loginAvailable: false` is the only input that reaches
+  // the unavailable copy; an `error` status would pass on the shared branch.
+  assert.match(textContent(harnesses), /Relay Login is unavailable because its connection URL is invalid\./)
   assert.strictEqual(
     findAll(harnesses, node => node.type === 'button' && textContent(node) === 'Connect Harnesses').length,
     0
@@ -177,4 +176,47 @@ test('invalid harness approval configuration is explained without a dead connect
     relay.calls.some(call => call.path === '/harnesses/login/start'),
     false
   )
+})
+
+test('a hostile approval URL is refused instead of being rendered as a link', async () => {
+  for (const verificationUrl of ['javascript:alert(1)', 'data:text/html,<script>alert(1)</script>', 'not a url', 'https://user:pw@relay.example.test/approve']) {
+    const relay = await loadRelay({
+      status: {
+        channels: { guidance: '', status: 'ready' },
+        harnesses: { loginAvailable: true, message: '', status: 'auth_required' }
+      },
+      rest: async (path, options) => {
+        if (path === '/connection/status') {
+          return {
+            channels: { guidance: '', status: 'ready' },
+            harnesses: { loginAvailable: true, status: 'auth_required' }
+          }
+        }
+        if (path === '/channels') return { channels: [] }
+        if (path === '/harnesses') return { harnesses: [] }
+        if (path === '/harnesses/login') return { status: 'idle' }
+        if (path === '/harnesses/login/start' && options?.method === 'POST') {
+          return { code: 'ABCD-1234', expiresAt: '2099-01-01T00:00:00.000Z', status: 'pending', verificationUrl }
+        }
+        throw new Error(`unexpected ${path}`)
+      }
+    })
+    const app = relay.mount()
+
+    await app.settle()
+    findButton(app.tree, 'Connect Harnesses').props.onClick()
+    await app.settle()
+
+    assert.strictEqual(
+      findAll(app.tree, node => node.type === 'a' && String(node.props?.href || '').startsWith('javascript:')).length,
+      0,
+      `${verificationUrl} must never reach an anchor href`
+    )
+    assert.strictEqual(
+      findAll(app.tree, node => node.props?.['data-login-status'] === 'pending').length,
+      0,
+      `${verificationUrl} must not open the approval prompt`
+    )
+    assert.match(textContent(app.tree), /invalid harness (approval URL|login details)/)
+  }
 })

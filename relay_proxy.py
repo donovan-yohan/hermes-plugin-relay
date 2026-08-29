@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -54,7 +55,13 @@ ACTOR_RENEW_MARGIN_SECONDS = 120
 ACTOR_RENEW_COMMAND = "actor-credentials.renew"
 ACTOR_FILE_RECHECK_SECONDS = 5
 ACTOR_LOGIN_DISPLAY_NAME = "Relay desktop plugin"
+ACTOR_LOGIN_CAPABILITIES = ("session:read",)
 MAX_LOGIN_FLOW_ID_BYTES = 256
+MAX_PUBLIC_URL_CHARS = 2048
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# Relay mints login flow ids with `crypto.randomUUID()`; accept nothing that
+# could re-enter path resolution once quoted into the approval/poll URLs.
+LOGIN_FLOW_ID_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 
 
 class RelayProxyError(Exception):
@@ -123,7 +130,7 @@ def validate_relay_base_url(value: str) -> str:
         or parsed.path not in ("", "/")
         or parsed.query
         or parsed.fragment
-        or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+        or parsed.hostname not in LOOPBACK_HOSTS
         or (port is not None and not 1 <= port <= 65535)
     ):
         raise RelayConfigurationError()
@@ -142,11 +149,13 @@ def validate_relay_public_url(value: str) -> str:
     if (
         not isinstance(value, str)
         or not value
+        or len(value) > MAX_PUBLIC_URL_CHARS
         or "\\" in value
         or any(
             character.isspace()
             or ord(character) < 0x20
             or ord(character) == 0x7F
+            or ord(character) > 0x7E
             for character in value
         )
     ):
@@ -169,6 +178,12 @@ def validate_relay_public_url(value: str) -> str:
     ):
         raise RelayConfigurationError()
     host = parsed.hostname
+    # The approval link carries a one-time flow id that is an unauthenticated
+    # bearer capability for the issued token: anyone who reads the URL in
+    # flight can race this process to Relay's one-shot poll. Plaintext HTTP is
+    # therefore only acceptable when the browser never leaves this machine.
+    if parsed.scheme == "http" and host not in LOOPBACK_HOSTS:
+        raise RelayConfigurationError()
     authority = f"[{host}]" if ":" in host else host
     if port is not None:
         authority = f"{authority}:{port}"
@@ -865,6 +880,11 @@ class ActorLaneClient:
         self._lock = threading.Lock()
         self._login_lock = threading.Lock()
         self._login_flow: HarnessLoginFlow | None = None
+        # env/file tokens deliberately survive a 401/403 (they are operator
+        # configuration, not ours to delete), so remember that the hub rejected
+        # this lane. Without it a stale-but-unexpired token would make
+        # start_login short-circuit forever with no way back.
+        self._lane_unauthorized = False
 
     @classmethod
     def from_environment(
@@ -972,16 +992,8 @@ class ActorLaneClient:
             ):
                 self._issued_token = None
                 self._issued_deadline = None
-            # Re-check a missing login file on a short cadence so running
-            # `relay-ide login` after Desktop starts does not require a restart.
-            if not self._file_checked or (
-                self._file_token is None and self._clock() >= self._file_next_check
-            ):
-                file_token, file_deadline = self._load_file_token()
-                self._file_token = file_token
-                self._file_deadline = file_deadline
-                self._file_checked = True
-                self._file_next_check = self._clock() + ACTOR_FILE_RECHECK_SECONDS
+            # Retire an expired file token FIRST, so the same call that
+            # notices the expiry can also pick up its replacement.
             if (
                 self._file_token is not None
                 and self._file_deadline is not None
@@ -993,6 +1005,16 @@ class ActorLaneClient:
                 # `relay-ide login` again while the old file token was live.
                 self._file_checked = False
                 self._file_next_check = 0.0
+            # Re-check a missing login file on a short cadence so running
+            # `relay-ide login` after Desktop starts does not require a restart.
+            if not self._file_checked or (
+                self._file_token is None and self._clock() >= self._file_next_check
+            ):
+                file_token, file_deadline = self._load_file_token()
+                self._file_token = file_token
+                self._file_deadline = file_deadline
+                self._file_checked = True
+                self._file_next_check = self._clock() + ACTOR_FILE_RECHECK_SECONDS
             return self._issued_token or self._configured_token or self._file_token
 
     def _clear_issued_token(self, token: str) -> None:
@@ -1047,9 +1069,11 @@ class ActorLaneClient:
             body=body,
         )
         if 200 <= response.status_code < 300:
+            self._lane_unauthorized = False
             return response.payload
         if response.status_code in (401, 403):
             self._clear_issued_token(token)
+            self._lane_unauthorized = True
             raise RelayAuthRequiredError(response.status_code)
         if response.status_code >= 500:
             raise RelayUnavailableError()
@@ -1152,12 +1176,29 @@ class ActorLaneClient:
     def login_available(self) -> bool:
         return not self._configuration_error and not self._login_configuration_error
 
+    def _usable_token(self) -> str | None:
+        """An active token the hub has not already rejected on this lane."""
+
+        if self._lane_unauthorized:
+            return None
+        return self._active_token()
+
     def accept_login_credential(self, token: Any, credential: Any) -> None:
         """Install one device-flow actor token without exposing it to callers."""
 
         if not isinstance(token, str) or not token.startswith("relay-sac-v1."):
             raise RelayMalformedResponseError()
         record = _mapping(credential)
+        # This lane is read-only by construction. Refuse anything the hub hands
+        # back that is broader than what start_login asked for, so a widened or
+        # mis-audienced credential can never be installed and used.
+        capabilities = record.get("capabilities")
+        if (
+            not isinstance(capabilities, list)
+            or tuple(capabilities) != ACTOR_LOGIN_CAPABILITIES
+            or record.get("audience") != ACTOR_AUDIENCE
+        ):
+            raise RelayMalformedResponseError()
         wall_deadline = _iso_timestamp(record.get("expiresAt"))
         remaining = wall_deadline - time.time()
         if remaining <= 0:
@@ -1165,17 +1206,24 @@ class ActorLaneClient:
         with self._lock:
             self._issued_token = token
             self._issued_deadline = self._clock() + remaining
+            self._lane_unauthorized = False
 
     def start_login(self) -> dict[str, str]:
         """Start Relay's browser/PIN flow and return only public approval data."""
 
         if not self.login_available():
             raise RelayConfigurationError()
-        if self._active_token() is not None:
+        if self._usable_token() is not None:
             return {"status": "ready"}
         with self._login_lock:
-            if self._active_token() is not None:
+            if self._usable_token() is not None:
                 return {"status": "ready"}
+            # Relay caps concurrent pending flows per hub. Reusing our own live
+            # flow keeps repeated Connect/Cancel cycles from exhausting that cap
+            # and locking the operator out for the flow TTL.
+            existing = self._login_flow
+            if existing is not None and time.time() < existing.deadline:
+                return existing.to_wire()
             body = json.dumps(
                 {
                     "actorId": ACTOR_CLIENT_ID,
@@ -1203,7 +1251,7 @@ class ActorLaneClient:
             code_body = code[:4] + code[5:]
             if (
                 len(flow_id.encode("utf-8")) > MAX_LOGIN_FLOW_ID_BYTES
-                or "/" in flow_id
+                or not LOGIN_FLOW_ID_PATTERN.match(flow_id)
                 or deadline <= time.time()
                 or len(code) != 9
                 or code[4:5] != "-"
@@ -1231,7 +1279,7 @@ class ActorLaneClient:
         """Poll one flow; capture an approved token exactly once in-process."""
 
         with self._login_lock:
-            if self._active_token() is not None:
+            if self._usable_token() is not None:
                 self._login_flow = None
                 return {"status": "ready"}
             flow = self._login_flow
@@ -1278,7 +1326,7 @@ class ActorLaneClient:
 
         with self._login_lock:
             self._login_flow = None
-        return {"status": "ready" if self._active_token() is not None else "idle"}
+        return {"status": "ready" if self._usable_token() is not None else "idle"}
 
     def harnesses(self) -> list[dict[str, Any]]:
         """Per-harness install rows with live session counts, hub-ordered."""
@@ -1370,6 +1418,7 @@ __all__ = [
     "ACTOR_CREDENTIAL_TTL_MS",
     "ACTOR_FILE_RECHECK_SECONDS",
     "ACTOR_CLIENT_ID",
+    "ACTOR_LOGIN_CAPABILITIES",
     "ACTOR_LOGIN_DISPLAY_NAME",
     "ACTOR_READ_TASK_REF",
     "ACTOR_RENEW_COMMAND",
@@ -1380,8 +1429,11 @@ __all__ = [
     "MAX_CLIENT_MESSAGE_ID_BYTES",
     "MAX_HARNESS_SESSIONS",
     "MAX_HISTORY_LIMIT",
+    "LOGIN_FLOW_ID_PATTERN",
+    "LOOPBACK_HOSTS",
     "MAX_LOGIN_FLOW_ID_BYTES",
     "MAX_MESSAGE_TEXT_BYTES",
+    "MAX_PUBLIC_URL_CHARS",
     "MAX_RELAY_RESPONSE_BYTES",
     "MAX_SESSION_ID_BYTES",
     "NATIVE_PROVIDERS",

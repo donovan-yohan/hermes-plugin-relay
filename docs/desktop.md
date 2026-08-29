@@ -107,10 +107,12 @@ backend. `localhost` is canonicalized to `127.0.0.1`, ambient proxies are
 disabled, and redirects are rejected before another credential-bearing hop.
 
 `RELAY_IDE_PUBLIC_URL` optionally supplies a distinct browser-visible root for
-the harness approval page, for example a tailnet hostname. It accepts only an
-HTTP/HTTPS root with no credentials, path, query, or fragment. This value is
-display-only: Relay API calls and every credential-bearing request continue to
-use the loopback-only `RELAY_IDE_URL`.
+the harness approval page, for example a tailnet hostname. It accepts only a
+root URL with no credentials, path, query, or fragment, and rejects plaintext
+`http` for any non-loopback host: the approval link embeds a one-time flow id
+that is a bearer capability for the issued token until it is redeemed. This
+value is display-only: Relay API calls and every credential-bearing request
+continue to use the loopback-only `RELAY_IDE_URL`.
 
 `RELAY_IDE_OPERATOR_CLIENT_TOKEN` supplies an existing Relay operator-client
 credential. If that is absent, `POST /connection/authorize` may redeem the
@@ -138,8 +140,10 @@ is never revoked, so a lost renew response can't lock the plugin out).
 When no actor token is live, Desktop's **Connect Harnesses** action starts
 Relay's `/cli-gateway/login` browser/PIN flow. The backend owns the flow id,
 polls Relay over loopback, and captures the approved `relay-sac-v1…` token
-exactly once. Renderer JavaScript receives only the approval URL, human code,
-expiry, and public flow state. This flow grants `session:read` with Relay's
+exactly once, and refuses to install it unless the returned credential record
+carries exactly `session:read` on the `relay:cli-gateway:v1` audience. Renderer
+JavaScript receives only the approval URL, human code, expiry, and public flow
+state. This flow grants `session:read` with Relay's
 standard read task-ref; it cannot authorize `channels.*` and is never presented
 as channel authorization.
 

@@ -331,11 +331,180 @@ def test_configured_environment_token_is_not_silent_about_rejection():
 
 def test_environment_construction_reads_both_lanes_independently(monkeypatch):
     monkeypatch.setenv("RELAY_IDE_URL", "http://127.0.0.1:9999")
+    monkeypatch.setenv("RELAY_IDE_PUBLIC_URL", "https://relay.example.test")
     monkeypatch.setenv("RELAY_IDE_ACTOR_TOKEN", "env-sac-value")
     monkeypatch.setenv("RELAY_IDE_ACTOR_GRANT", "env-grant-value")
     lane = ActorLaneClient.from_environment()
     assert lane._base_url == "http://127.0.0.1:9999"
+    assert lane._approval_base_url == "https://relay.example.test"
     assert lane._grant == "env-grant-value"
+
+
+def test_actor_status_is_independent_and_does_not_dial_without_a_token():
+    missing, missing_transport = make_lane(lambda **_call: pytest.fail("must not dial"))
+    assert missing.status().to_wire() == {
+        "status": "auth_required",
+        "message": "Harness authorization is required",
+    }
+    assert missing_transport.calls == []
+
+    ready, ready_transport = make_lane(
+        lambda **_call: RelayHttpResponse(200, harness_report()),
+        actor_token="configured-sac",
+    )
+    assert ready.status().to_wire() == {"status": "ready"}
+    assert ready_transport.calls[0]["url"].endswith(NATIVE_LIST_PATH)
+
+
+def test_browser_login_projects_public_fields_and_captures_token_exactly_once():
+    secret = "relay-sac-v1.device-flow-secret"
+    flow_id = "11111111-2222-3333-4444-555555555555"
+    poll_count = 0
+
+    def handler(**call):
+        nonlocal poll_count
+        if call["url"].endswith("/cli-gateway/login/start"):
+            return RelayHttpResponse(
+                201,
+                {
+                    "flowId": flow_id,
+                    "code": "ABCD-1234",
+                    "expiresAt": "2099-01-01T00:00:00.000Z",
+                    "verificationUrl": (
+                        f"http://127.0.0.1:3456/cli-gateway/login/{flow_id}/approve"
+                    ),
+                },
+            )
+        if call["url"].endswith(f"/cli-gateway/login/{flow_id}"):
+            poll_count += 1
+            if poll_count == 1:
+                return RelayHttpResponse(200, {"status": "pending"})
+            return RelayHttpResponse(
+                200,
+                {
+                    "status": "approved",
+                    "token": secret,
+                    "credential": {
+                        "id": "sac:device",
+                        "expiresAt": "2099-01-01T00:00:00.000Z",
+                    },
+                },
+            )
+        if call["url"].endswith(NATIVE_LIST_PATH):
+            return RelayHttpResponse(200, harness_report())
+        return pytest.fail(f"unexpected Relay call: {call['url']}")
+
+    lane, transport = make_lane(
+        handler,
+        public_url="http://dev.example.test:3456",
+    )
+    started = lane.start_login()
+    assert started == {
+        "status": "pending",
+        "code": "ABCD-1234",
+        "expiresAt": "2099-01-01T00:00:00.000Z",
+        "verificationUrl": (
+            f"http://dev.example.test:3456/cli-gateway/login/{flow_id}/approve"
+        ),
+    }
+    assert secret not in json.dumps(started)
+    assert json.loads(transport.calls[0]["body"]) == {
+        "actorId": "desktop-plugin-harness-view",
+        "displayName": "Relay desktop plugin",
+        "capabilities": ["session:read"],
+    }
+
+    assert lane.poll_login() == started
+    approved = lane.poll_login()
+    assert approved == {"status": "ready"}
+    assert secret not in json.dumps(approved)
+    assert lane.poll_login() == {"status": "ready"}
+    assert poll_count == 2, "the one-shot approved response is never polled again"
+
+    lane.harnesses()
+    assert transport.calls[-1]["headers"]["Authorization"] == f"Bearer {secret}"
+
+
+@pytest.mark.parametrize(
+    ("upstream_status", "message"),
+    [
+        ("denied", "Relay login was denied."),
+        ("expired", "The Relay login code expired."),
+        ("consumed", "This Relay login was already used. Start again."),
+    ],
+)
+def test_browser_login_projects_terminal_states_and_forgets_the_flow(
+    upstream_status, message
+):
+    flow_id = "11111111-2222-3333-4444-555555555555"
+
+    def handler(**call):
+        if call["url"].endswith("/cli-gateway/login/start"):
+            return RelayHttpResponse(
+                201,
+                {
+                    "flowId": flow_id,
+                    "code": "ABCD-1234",
+                    "expiresAt": "2099-01-01T00:00:00.000Z",
+                    "verificationUrl": "http://127.0.0.1:3456/ignored",
+                },
+            )
+        return RelayHttpResponse(200, {"status": upstream_status})
+
+    lane, _ = make_lane(handler)
+    lane.start_login()
+    assert lane.poll_login() == {"status": upstream_status, "message": message}
+    assert lane.poll_login() == {"status": "idle"}
+
+
+def test_malformed_one_shot_approval_is_not_polled_again():
+    flow_id = "11111111-2222-3333-4444-555555555555"
+    polls = 0
+
+    def handler(**call):
+        nonlocal polls
+        if call["url"].endswith("/cli-gateway/login/start"):
+            return RelayHttpResponse(
+                201,
+                {
+                    "flowId": flow_id,
+                    "code": "ABCD-1234",
+                    "expiresAt": "2099-01-01T00:00:00.000Z",
+                    "verificationUrl": "http://127.0.0.1:3456/ignored",
+                },
+            )
+        polls += 1
+        return RelayHttpResponse(
+            200,
+            {
+                "status": "approved",
+                "token": "not-an-actor-token",
+                "credential": {"expiresAt": "2099-01-01T00:00:00.000Z"},
+            },
+        )
+
+    lane, _ = make_lane(handler)
+    lane.start_login()
+    with pytest.raises(RelayMalformedResponseError):
+        lane.poll_login()
+    assert lane.poll_login() == {"status": "idle"}
+    assert polls == 1
+
+
+def test_invalid_public_url_disables_browser_login_without_dialing():
+    lane, transport = make_lane(
+        lambda **_call: pytest.fail("invalid login configuration must not dial"),
+        public_url="https://relay.example.test/approve",
+    )
+
+    assert lane.login_available() is False
+    assert lane.status().to_wire() == {
+        "status": "error",
+        "message": "Relay public approval URL is invalid",
+    }
+    with pytest.raises(RelayConfigurationError):
+        lane.start_login()
+    assert transport.calls == []
 
 
 # --- login file (#1435) + renewal --------------------------------------------
@@ -409,6 +578,30 @@ def test_login_file_expired_or_missing_yields_nothing(tmp_path, monkeypatch):
         lane.harnesses()
 
 
+def test_missing_login_file_is_rechecked_after_short_cache(tmp_path):
+    clock = [10.0]
+    token_file = tmp_path / "actor-token.json"
+    lane, _ = make_lane(
+        lambda **_call: RelayHttpResponse(200, harness_report()),
+        token_file=str(token_file),
+        clock=lambda: clock[0],
+    )
+
+    assert lane._active_token() is None
+    token_file.write_text(
+        json.dumps(
+            {
+                "token": "relay-sac-v1.created-later",
+                "expiresAt": "2099-01-01T00:00:00.000Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert lane._active_token() is None, "a missing file is cached briefly"
+    clock[0] += 5
+    assert lane._active_token() == "relay-sac-v1.created-later"
+
+
 def test_renewal_fires_before_expiry_and_swaps_token():
     clock = [100.0]
     original_token = "relay-sac-v1.original"
@@ -475,3 +668,30 @@ def test_renewal_failure_keeps_old_token_working():
     lane.harnesses()
     list_calls = [c for c in transport.calls if c["url"].endswith("/sessions/native")]
     assert list_calls[0]["headers"]["Authorization"] == "Bearer relay-sac-v1.original"
+
+
+def test_renewal_rejects_naive_expiry_and_uses_bounded_fallback():
+    clock = [100.0]
+
+    def handler(**call):
+        if call["url"].endswith("/cli-gateway/actor-credentials/renew"):
+            return RelayHttpResponse(
+                201,
+                {
+                    "token": "relay-sac-v1.renewed",
+                    "credential": {"expiresAt": "2099-01-01T00:00:00"},
+                },
+            )
+        return RelayHttpResponse(200, harness_report())
+
+    lane, _ = make_lane(
+        handler,
+        actor_token="relay-sac-v1.original",
+        clock=lambda: clock[0],
+    )
+    with lane._lock:
+        lane._configured_deadline = clock[0] + 60
+
+    lane.harnesses()
+
+    assert lane._issued_deadline == clock[0] + ACTOR_CREDENTIAL_TTL_MS / 1000

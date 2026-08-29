@@ -6,6 +6,7 @@
 
 import {
   Button,
+  CopyButton,
   EmptyState,
   ErrorState,
   host,
@@ -23,6 +24,7 @@ const RELAY_ROUTE = '/relay'
 const POLL_INTERVAL_MS = 3_000
 const HISTORY_LIMIT = 50
 const CONNECTION_STATES = new Set(['ready', 'offline', 'auth_required', 'error'])
+const LOGIN_STATES = new Set(['idle', 'pending', 'ready', 'denied', 'expired', 'consumed'])
 const NON_RETRYABLE_STATUS_CODES = new Set([400, 404, 409, 413])
 const RELAY_WORKSPACE_ID = `${PLUGIN_ID}:home`
 const HARNESS_PROVIDERS = ['claude', 'codex', 'hermes', 'opencode', 'pi', 'prime-agent', 'dsh', 'antigravity']
@@ -96,7 +98,7 @@ function isRetryableError(error) {
   return !NON_RETRYABLE_STATUS_CODES.has(statusCode(error))
 }
 
-function normalizeConnection(response) {
+function normalizeLaneConnection(response) {
   const status = typeof response === 'string' ? response : response?.status
 
   if (!CONNECTION_STATES.has(status)) {
@@ -104,6 +106,49 @@ function normalizeConnection(response) {
   }
 
   return { message: text(response?.message), status }
+}
+
+function normalizeConnections(response) {
+  const channels = normalizeLaneConnection(response?.channels)
+  const harnesses = normalizeLaneConnection(response?.harnesses)
+
+  return {
+    channels: {
+      ...channels,
+      guidance: text(response?.channels?.guidance)
+    },
+    harnesses: {
+      ...harnesses,
+      loginAvailable: response?.harnesses?.loginAvailable === true
+    }
+  }
+}
+
+function normalizeHarnessLogin(response) {
+  const status = text(response?.status)
+
+  if (!LOGIN_STATES.has(status)) {
+    throw new Error('Relay returned an invalid harness login status.')
+  }
+  if (status !== 'pending') {
+    return { message: text(response?.message), status }
+  }
+
+  const code = text(response?.code).trim()
+  const expiresAt = text(response?.expiresAt).trim()
+  const verificationUrl = text(response?.verificationUrl).trim()
+  let parsed
+
+  try {
+    parsed = new URL(verificationUrl)
+  } catch {
+    throw new Error('Relay returned an invalid harness approval URL.')
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || !code || !expiresAt) {
+    throw new Error('Relay returned invalid harness login details.')
+  }
+
+  return { code, expiresAt, message: text(response?.message), status, verificationUrl: parsed.href }
 }
 
 function normalizeChannels(response) {
@@ -380,71 +425,194 @@ function RelayPane() {
   })
 }
 
-function ConnectionBanner({ connection, onAuthorize, onRetry, pending }) {
-  const copy = {
-    auth_required: {
-      action: 'Authorize Relay',
-      body: connection.message || 'Relay needs authorization before channels can be updated.',
-      title: 'Authorization required'
-    },
+function laneTone(status) {
+  return status === 'ready' ? 'good' : status === 'offline' ? 'bad' : 'warn'
+}
+
+function laneCopy(lane, connection) {
+  const shared = {
     error: {
-      action: 'Retry connection',
       body: connection.message || 'Relay returned a recoverable connection error.',
-      title: 'Relay needs attention'
+      title: `${lane} need attention`
     },
     loading: {
-      body: 'Checking the Relay connection…',
-      title: 'Connecting to Relay'
+      body: 'Checking this Relay connection…',
+      title: `Checking ${lane.toLowerCase()}`
     },
     offline: {
-      action: 'Retry connection',
-      body: 'Showing cached transcript data. Your draft is preserved and sending is paused.',
-      title: 'Relay is offline'
-    },
-    ready: {
-      body: 'Channel updates are live.',
-      title: 'Relay connected'
+      body: 'Relay is unavailable. Existing data stays visible while reconnecting.',
+      title: `${lane} are offline`
     }
-  }[connection.status] || {
-    action: 'Retry connection',
-    body: 'Relay returned an unknown state.',
-    title: 'Relay needs attention'
   }
 
-  const action = connection.status === 'auth_required' ? onAuthorize : onRetry
+  if (shared[connection.status]) {
+    return shared[connection.status]
+  }
+  if (lane === 'Channels') {
+    return connection.status === 'ready'
+      ? { body: 'Channel updates and sending are live.', title: 'Channels connected' }
+      : {
+          body: connection.guidance || 'Channels need an operator-client credential or an approved channel-scoped grant.',
+          title: 'Operator access required'
+        }
+  }
+  return connection.status === 'ready'
+    ? { body: 'Native harness sessions are available read-only.', title: 'Harnesses connected' }
+    : {
+        body: connection.loginAvailable
+          ? 'Use Relay Login to approve read-only harness access in your browser.'
+          : 'Relay Login is unavailable because its connection URL is invalid.',
+        title: 'Harnesses not connected'
+      }
+}
 
-  return jsxs('section', {
-    'aria-live': 'polite',
-    className: cn(
-      'flex shrink-0 items-center justify-between gap-3 border-b border-(--ui-stroke-tertiary) px-4 py-2 text-sm',
-      connection.status === 'ready' ? 'text-(--ui-text-secondary)' : 'text-(--ui-text-primary)'
-    ),
-    'data-connection': connection.status,
-    role: 'status',
+function HarnessLoginPrompt({ login, onCancel, onPoll, pending }) {
+  if (login?.status !== 'pending') {
+    return null
+  }
+
+  return jsxs('div', {
+    className: 'mt-3 border-t border-(--ui-stroke-tertiary) pt-3',
+    'data-login-status': 'pending',
     children: [
+      jsx('p', {
+        className: 'text-xs text-(--ui-text-secondary)',
+        children: 'Open the approval page, enter your Relay PIN, and confirm this code. This panel updates automatically.'
+      }),
       jsxs('div', {
-        className: 'flex min-w-0 items-center gap-2',
+        className: 'mt-2 flex flex-wrap items-center gap-2',
         children: [
-          jsx(StatusDot, { tone: connection.status === 'ready' ? 'good' : connection.status === 'offline' ? 'bad' : 'warn' }),
+          jsx('code', {
+            className: 'select-all rounded-sm border border-(--ui-stroke-secondary) px-2 py-1 font-mono text-sm tracking-wider',
+            'data-login-code': login.code,
+            children: login.code
+          }),
+          jsx(CopyButton, { appearance: 'inline', label: 'Copy code', text: login.code })
+        ]
+      }),
+      jsxs('div', {
+        className: 'mt-2 flex min-w-0 flex-wrap items-center gap-2',
+        children: [
+          jsx('a', {
+            'aria-label': 'Open approval page',
+            className: 'min-w-0 truncate text-xs text-(--ui-accent) underline underline-offset-2',
+            href: login.verificationUrl,
+            rel: 'noopener noreferrer',
+            target: '_blank',
+            children: login.verificationUrl
+          }),
+          jsx(CopyButton, { appearance: 'inline', label: 'Copy URL', text: login.verificationUrl })
+        ]
+      }),
+      jsxs('div', {
+        className: 'mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-(--ui-text-tertiary)',
+        children: [
+          jsx('span', { children: login.message || `Expires ${formatStamp(login.expiresAt)}` }),
           jsxs('div', {
-            className: 'min-w-0',
+            className: 'flex items-center gap-1',
             children: [
-              jsx('div', { className: 'font-medium', children: copy.title }),
-              jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: copy.body })
+              jsx(Button, { disabled: pending, onClick: () => void onPoll(), size: 'xs', type: 'button', variant: 'ghost', children: 'Check now' }),
+              jsx(Button, { disabled: pending, onClick: () => void onCancel(), size: 'xs', type: 'button', variant: 'ghost', children: 'Cancel' })
             ]
           })
         ]
+      })
+    ]
+  })
+}
+
+function ConnectionPanel({ connections, login, loginPending, onCancelLogin, onConnectHarnesses, onOpenChannelSetup, onPollLogin, onRetry, pending, setupNote }) {
+  const channelCopy = laneCopy('Channels', connections.channels)
+  const harnessCopy = laneCopy('Harnesses', connections.harnesses)
+  const loginNeedsRestart = ['denied', 'expired', 'consumed', 'error'].includes(login?.status)
+  const showConnect = connections.harnesses.status === 'auth_required' && connections.harnesses.loginAvailable && login?.status !== 'pending'
+
+  return jsxs('section', {
+    'aria-label': 'Relay connections',
+    'aria-live': 'polite',
+    className: 'grid shrink-0 gap-2 border-b border-(--ui-stroke-tertiary) p-3 text-sm md:grid-cols-2',
+    role: 'status',
+    children: [
+      jsxs('div', {
+        className: 'min-w-0 border border-(--ui-stroke-tertiary) p-3',
+        'data-connection': connections.channels.status,
+        'data-lane': 'channels',
+        children: [
+          jsxs('div', {
+            className: 'flex items-start justify-between gap-3',
+            children: [
+              jsxs('div', {
+                className: 'flex min-w-0 items-start gap-2',
+                children: [
+                  jsx(StatusDot, { tone: laneTone(connections.channels.status) }),
+                  jsxs('div', {
+                    className: 'min-w-0',
+                    children: [
+                      jsx('div', { className: 'font-medium', children: channelCopy.title }),
+                      jsx('div', { className: 'mt-0.5 text-xs text-(--ui-text-tertiary)', children: channelCopy.body })
+                    ]
+                  })
+                ]
+              }),
+              connections.channels.status !== 'ready'
+                ? jsxs('div', {
+                    className: 'flex items-center gap-1',
+                    children: [
+                      connections.channels.status === 'auth_required'
+                        ? jsx(Button, { disabled: pending, onClick: () => void onOpenChannelSetup(), size: 'xs', type: 'button', variant: 'secondary', children: 'Open Relay' })
+                        : null,
+                      jsx(Button, { disabled: pending, onClick: () => void onRetry(), size: 'xs', type: 'button', variant: 'ghost', children: 'Refresh' })
+                    ]
+                  })
+                : null
+            ]
+          }),
+          setupNote && connections.channels.status !== 'ready'
+            ? jsx('p', { className: 'mt-2 text-xs text-(--ui-text-secondary)', 'data-channel-setup': 'true', children: setupNote })
+            : null
+        ]
       }),
-      copy.action
-        ? jsx(Button, {
-            disabled: pending,
-            onClick: () => void action(),
-            size: 'sm',
-            type: 'button',
-            variant: 'secondary',
-            children: pending ? 'Working…' : copy.action
-          })
-        : null
+      jsxs('div', {
+        className: 'min-w-0 border border-(--ui-stroke-tertiary) p-3',
+        'data-connection': connections.harnesses.status,
+        'data-lane': 'harnesses',
+        children: [
+          jsxs('div', {
+            className: 'flex items-start justify-between gap-3',
+            children: [
+              jsxs('div', {
+                className: 'flex min-w-0 items-start gap-2',
+                children: [
+                  jsx(StatusDot, { tone: laneTone(connections.harnesses.status) }),
+                  jsxs('div', {
+                    className: 'min-w-0',
+                    children: [
+                      jsx('div', { className: 'font-medium', children: harnessCopy.title }),
+                      jsx('div', { className: 'mt-0.5 text-xs text-(--ui-text-tertiary)', children: harnessCopy.body })
+                    ]
+                  })
+                ]
+              }),
+              showConnect
+                ? jsx(Button, {
+                    disabled: loginPending,
+                    onClick: () => void onConnectHarnesses(),
+                    size: 'xs',
+                    type: 'button',
+                    variant: 'secondary',
+                    children: loginPending ? 'Starting…' : loginNeedsRestart ? 'Start again' : 'Connect Harnesses'
+                  })
+                : connections.harnesses.status === 'offline' || connections.harnesses.status === 'error'
+                  ? jsx(Button, { disabled: pending, onClick: () => void onRetry(), size: 'xs', type: 'button', variant: 'ghost', children: 'Refresh' })
+                  : null
+            ]
+          }),
+          loginNeedsRestart
+            ? jsx('p', { className: 'mt-2 text-xs text-(--ui-text-secondary)', 'data-login-status': login.status, children: login.message || 'Relay Login did not complete. Start a fresh flow.' })
+            : null,
+          jsx(HarnessLoginPrompt, { login, onCancel: onCancelLogin, onPoll: onPollLogin, pending: loginPending })
+        ]
+      })
     ]
   })
 }
@@ -464,7 +632,7 @@ function ChannelList({ channels, error, loading, onRetry, onSelect, selectedChan
 
   if (channels.length === 0) {
     return jsx(EmptyState, {
-      description: 'Connect or authorize Relay, then retry to load the channels available to you.',
+      description: 'Configure Relay operator access, then retry to load the channels available to you.',
       title: 'No Relay channels yet'
     })
   }
@@ -733,7 +901,13 @@ function SessionDetail({ detail }) {
 
 function RelayPage() {
   const ctx = pluginContext
-  const [connection, setConnection] = useState({ message: '', status: 'loading' })
+  const [connections, setConnections] = useState({
+    channels: { guidance: '', message: '', status: 'loading' },
+    harnesses: { loginAvailable: false, message: '', status: 'loading' }
+  })
+  const [harnessLogin, setHarnessLogin] = useState({ message: '', status: 'idle' })
+  const [channelSetup, setChannelSetup] = useState('')
+  const [loginPending, setLoginPending] = useState(false)
   const [channels, setChannels] = useState([])
   const [channelError, setChannelError] = useState('')
   const [selectedChannelId, setSelectedChannelId] = useState('')
@@ -752,6 +926,8 @@ function RelayPage() {
   const [sessionSelection, setSessionSelection] = useState({ id: '', provider: '' })
   const [sessionDetail, setSessionDetail] = useState(null)
 
+  const connection = connections.channels
+  const harnessConnection = connections.harnesses
   const connectionRef = useRef(connection)
   const selectedRef = useRef(selectedChannelId)
   const historyRef = useRef(history)
@@ -760,6 +936,7 @@ function RelayPage() {
   const retryRef = useRef(null)
   const sessionGeneration = useRef({})
   const detailGeneration = useRef(0)
+  const loginPollInFlight = useRef(false)
 
   connectionRef.current = connection
   selectedRef.current = selectedChannelId
@@ -774,9 +951,25 @@ function RelayPage() {
     setHistory(next)
   }, [])
 
-  const noteAuthRequired = useCallback(error => {
+  const noteChannelAuthRequired = useCallback(error => {
     if (isAuthError(error)) {
-      setConnection({ message: '', status: 'auth_required' })
+      setConnections(current => ({
+        ...current,
+        channels: { ...current.channels, message: '', status: 'auth_required' }
+      }))
+
+      return true
+    }
+
+    return false
+  }, [])
+
+  const noteHarnessAuthRequired = useCallback(error => {
+    if (isAuthError(error)) {
+      setConnections(current => ({
+        ...current,
+        harnesses: { ...current.harnesses, message: '', status: 'auth_required' }
+      }))
 
       return true
     }
@@ -806,14 +999,14 @@ function RelayPage() {
         return
       }
 
-      const authRequired = noteAuthRequired(error)
+      const authRequired = noteChannelAuthRequired(error)
       patchHistory(channelId, current => ({
         ...current,
         error: authRequired ? 'Relay authorization is required to refresh this transcript.' : errorMessage(error, 'Relay could not refresh this transcript.'),
         loading: false
       }))
     }
-  }, [ctx, noteAuthRequired, patchHistory])
+  }, [ctx, noteChannelAuthRequired, patchHistory])
 
   const chooseChannel = useCallback(async channelId => {
     if (!channelId) {
@@ -829,7 +1022,12 @@ function RelayPage() {
 
   const refreshPage = useCallback(async () => {
     if (typeof ctx?.rest !== 'function') {
-      setConnection({ message: 'Relay’s local API bridge is unavailable.', status: 'error' })
+      const unavailable = { message: 'Relay’s local API bridge is unavailable.', status: 'error' }
+
+      setConnections({
+        channels: { ...unavailable, guidance: '' },
+        harnesses: { ...unavailable, loginAvailable: false }
+      })
 
       return
     }
@@ -837,10 +1035,20 @@ function RelayPage() {
     setPending(true)
 
     try {
-      const status = normalizeConnection(await ctx.rest('/connection/status'))
+      const status = normalizeConnections(await ctx.rest('/connection/status'))
 
-      setConnection(status)
-      if (status.status !== 'ready') {
+      setConnections(status)
+      if (status.harnesses.status === 'ready') {
+        setHarnessLogin({ message: '', status: 'ready' })
+      } else if (status.harnesses.status === 'auth_required') {
+        try {
+          setHarnessLogin(normalizeHarnessLogin(await ctx.rest('/harnesses/login')))
+        } catch (error) {
+          setHarnessLogin({ message: errorMessage(error, 'Relay Login status could not be checked.'), status: 'error' })
+        }
+      }
+
+      if (status.channels.status !== 'ready') {
         return
       }
 
@@ -871,67 +1079,29 @@ function RelayPage() {
           setSelectedChannelId('')
         }
       } catch (error) {
-        if (noteAuthRequired(error)) {
+        if (noteChannelAuthRequired(error)) {
           return
         }
 
         setChannelError(errorMessage(error, 'Relay could not refresh channels.'))
       }
     } catch (error) {
-      if (!noteAuthRequired(error)) {
-        setConnection({ message: errorMessage(error, 'Relay could not check the connection.'), status: 'error' })
-      }
+      const message = errorMessage(error, 'Relay could not check the connection.')
+
+      setConnections({
+        channels: { guidance: '', message, status: 'error' },
+        harnesses: { loginAvailable: false, message, status: 'error' }
+      })
     } finally {
       setPending(false)
     }
-  }, [chooseChannel, ctx, noteAuthRequired])
+  }, [chooseChannel, ctx, noteChannelAuthRequired])
 
   const refreshLatest = useCallback(async () => {
     if (connectionRef.current.status === 'ready' && selectedRef.current) {
       await loadHistory(selectedRef.current)
     }
   }, [loadHistory])
-
-  const authorize = useCallback(async () => {
-    if (typeof ctx?.rest !== 'function') {
-      setConnection({ message: 'Relay’s local API bridge is unavailable.', status: 'error' })
-
-      return
-    }
-
-    setPending(true)
-
-    try {
-      await ctx.rest('/connection/authorize', { method: 'POST' })
-      await refreshPage()
-    } catch (error) {
-      if (isAuthError(error)) {
-        noteAuthRequired(error)
-        try {
-          const onboarding = await ctx.rest('/connection/onboarding')
-          const opened = typeof onboarding?.url === 'string'
-            && typeof ctx?.os?.openExternal === 'function'
-            && await ctx.os.openExternal(onboarding.url)
-
-          setConnection({
-            message: opened
-              ? 'Relay opened in your browser. Supply an approved scoped grant when starting Hermes, then restart Hermes and authorize again.'
-              : 'Supply an approved scoped grant when starting Hermes, then restart Hermes and authorize again.',
-            status: 'auth_required'
-          })
-        } catch (onboardingError) {
-          setConnection({
-            message: `Relay could not be opened. Supply an approved scoped grant when starting Hermes, then restart Hermes and authorize again. ${errorMessage(onboardingError, '')}`.trim(),
-            status: 'auth_required'
-          })
-        }
-      } else {
-        setConnection({ message: errorMessage(error, 'Relay authorization could not be started.'), status: 'error' })
-      }
-    } finally {
-      setPending(false)
-    }
-  }, [ctx, noteAuthRequired, refreshPage])
 
   const send = useCallback(async manualRetry => {
     const channelId = selectedRef.current
@@ -967,13 +1137,13 @@ function RelayPage() {
         error: isAuthError(error) ? 'Relay authorization is required before sending.' : errorMessage(error, 'Relay could not confirm this message. Retry safely with the same message id.'),
         retryable: isRetryableError(error)
       })
-      noteAuthRequired(error)
+      noteChannelAuthRequired(error)
     } finally {
       setSending(false)
       // An accepted post (or an ambiguous transport result) can change history.
       void loadHistory(channelId)
     }
-  }, [ctx, draft, loadHistory, noteAuthRequired])
+  }, [ctx, draft, loadHistory, noteChannelAuthRequired])
 
   const loadHarnesses = useCallback(async () => {
     if (typeof ctx?.rest !== 'function') {
@@ -988,11 +1158,109 @@ function RelayPage() {
       setHarnesses(nextHarnesses)
       setHarnessError('')
     } catch (error) {
-      if (!noteAuthRequired(error)) {
+      if (!noteHarnessAuthRequired(error)) {
         setHarnessError(errorMessage(error, 'Relay could not list harness sessions.'))
       }
     }
-  }, [ctx, noteAuthRequired])
+  }, [ctx, noteHarnessAuthRequired])
+
+  const pollHarnessLogin = useCallback(async () => {
+    if (typeof ctx?.rest !== 'function' || loginPollInFlight.current) {
+      return
+    }
+
+    loginPollInFlight.current = true
+    try {
+      const next = normalizeHarnessLogin(await ctx.rest('/harnesses/login'))
+
+      setHarnessLogin(next)
+      if (next.status === 'ready') {
+        setConnections(current => ({
+          ...current,
+          harnesses: { ...current.harnesses, message: '', status: 'ready' }
+        }))
+        await refreshPage()
+      }
+    } catch (error) {
+      const message = errorMessage(error, 'Relay Login status could not be checked.')
+
+      setHarnessLogin(current => current.status === 'pending'
+        ? { ...current, message }
+        : { message, status: 'error' })
+    } finally {
+      loginPollInFlight.current = false
+    }
+  }, [ctx, refreshPage])
+
+  const startHarnessLogin = useCallback(async () => {
+    if (typeof ctx?.rest !== 'function') {
+      setHarnessLogin({ message: 'Relay’s local API bridge is unavailable.', status: 'error' })
+
+      return
+    }
+
+    setLoginPending(true)
+    try {
+      const next = normalizeHarnessLogin(await ctx.rest('/harnesses/login/start', { method: 'POST' }))
+
+      setHarnessLogin(next)
+      if (next.status === 'ready') {
+        setConnections(current => ({
+          ...current,
+          harnesses: { ...current.harnesses, message: '', status: 'ready' }
+        }))
+        await refreshPage()
+      }
+    } catch (error) {
+      setHarnessLogin({ message: errorMessage(error, 'Relay Login could not be started.'), status: 'error' })
+    } finally {
+      setLoginPending(false)
+    }
+  }, [ctx, refreshPage])
+
+  // Channel operator access is still grant-based: the backend hands back only
+  // the validated loopback Relay root so Desktop can open setup without ever
+  // seeing a grant or credential.
+  const openChannelSetup = useCallback(async () => {
+    if (typeof ctx?.rest !== 'function') {
+      setChannelSetup('Relay\u2019s local API bridge is unavailable.')
+
+      return
+    }
+
+    const recovery = 'Supply an approved scoped grant when starting Hermes, then restart Hermes and refresh.'
+
+    try {
+      const onboarding = await ctx.rest('/connection/onboarding')
+      const url = text(onboarding?.url)
+      const opened = Boolean(url)
+        && typeof ctx?.os?.openExternal === 'function'
+        && Boolean(await ctx.os.openExternal(url))
+
+      setChannelSetup(opened ? `Relay opened in your browser. ${recovery}` : recovery)
+    } catch (error) {
+      setChannelSetup(`Relay could not be opened. ${recovery} ${errorMessage(error, '')}`.trim())
+    }
+  }, [ctx])
+
+  const cancelHarnessLogin = useCallback(async () => {
+    if (typeof ctx?.rest !== 'function') {
+      return
+    }
+
+    setLoginPending(true)
+    try {
+      setHarnessLogin(normalizeHarnessLogin(await ctx.rest('/harnesses/login', { method: 'DELETE' })))
+    } catch (error) {
+      const message = errorMessage(error, 'Relay Login could not be cancelled.')
+
+      setHarnessLogin(current => current.status === 'pending'
+        ? { ...current, message }
+        : { message, status: 'error' })
+    } finally {
+      setLoginPending(false)
+    }
+  }, [ctx])
 
   const toggleProvider = useCallback(provider => {
     setExpandedProviders(current =>
@@ -1031,6 +1299,7 @@ function RelayPage() {
           return
         }
 
+        noteHarnessAuthRequired(error)
         setSessionCache(cache => ({
           ...cache,
           [provider]: {
@@ -1041,7 +1310,7 @@ function RelayPage() {
         }))
       }
     })()
-  }, [ctx, expandedProviders, harnesses])
+  }, [ctx, expandedProviders, harnesses, noteHarnessAuthRequired])
 
   const chooseSession = useCallback(async (provider, sessionId) => {
     if (!provider || !sessionId || typeof ctx?.rest !== 'function') {
@@ -1070,13 +1339,14 @@ function RelayPage() {
         return
       }
 
+      noteHarnessAuthRequired(error)
       setSessionDetail({
         loading: false,
         snapshot: null,
         error: isAuthError(error) ? 'Relay authorization is required for this session.' : errorMessage(error, 'Relay could not read this session snapshot.')
       })
     }
-  }, [ctx])
+  }, [ctx, noteHarnessAuthRequired])
 
   useEffect(() => {
     void refreshPage()
@@ -1085,10 +1355,22 @@ function RelayPage() {
   // Harness rows load when the operator switches to the harness surface, and
   // refresh on each switch so a freshly started harness shows up.
   useEffect(() => {
-    if (surface === 'harnesses' && connection.status === 'ready') {
+    if (surface === 'harnesses' && harnessConnection.status === 'ready') {
       void loadHarnesses()
     }
-  }, [connection.status, loadHarnesses, surface])
+  }, [harnessConnection.status, loadHarnesses, surface])
+
+  useEffect(() => {
+    if (harnessLogin.status !== 'pending') {
+      return undefined
+    }
+
+    const timer = setInterval(() => {
+      void pollHarnessLogin()
+    }, POLL_INTERVAL_MS)
+
+    return () => clearInterval(timer)
+  }, [harnessLogin.status, pollHarnessLogin])
 
   useEffect(() => {
     if (connection.status !== 'ready' || !selectedChannelId) {
@@ -1110,14 +1392,25 @@ function RelayPage() {
     : connection.status === 'offline'
       ? 'Relay is offline. Your draft is preserved until it reconnects.'
       : connection.status === 'auth_required'
-        ? 'Authorize Relay before sending.'
+        ? 'Channel operator access is required before sending.'
         : 'Write a message…'
 
   return jsxs('main', {
     'aria-label': 'Relay channels',
     className: 'flex h-full min-h-0 flex-col text-(--ui-text-primary)',
     children: [
-      jsx(ConnectionBanner, { connection, onAuthorize: authorize, onRetry: refreshPage, pending }),
+      jsx(ConnectionPanel, {
+        connections,
+        login: harnessLogin,
+        loginPending,
+        onCancelLogin: cancelHarnessLogin,
+        onConnectHarnesses: startHarnessLogin,
+        onOpenChannelSetup: openChannelSetup,
+        onPollLogin: pollHarnessLogin,
+        onRetry: refreshPage,
+        pending,
+        setupNote: channelSetup
+      }),
       jsxs('div', {
         className: 'flex min-h-0 flex-1 flex-col md:flex-row',
         children: [

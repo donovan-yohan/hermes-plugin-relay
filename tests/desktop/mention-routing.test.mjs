@@ -55,15 +55,18 @@ test('renders distinct channel-empty and transcript-empty states', async () => {
   assert.ok(transcriptState, 'an existing channel has its own transcript-empty state')
 })
 
-test('401 and 403 move the page into the authorization state and post only to the scoped authorize endpoint', async () => {
+test('channel 401 and 403 update only the operator lane and never start harness login', async () => {
   for (const status of [401, 403]) {
     const relay = await loadRelay({
       rest: async path => {
         if (path === '/connection/status') {
-          throw responseError(status, 'Relay login expired')
+          return {
+            channels: { guidance: 'Operator access is required.', status: 'ready' },
+            harnesses: { loginAvailable: true, status: 'ready' }
+          }
         }
-        if (path === '/connection/authorize') {
-          return { ok: true }
+        if (path === '/channels') {
+          throw responseError(status, 'Relay operator credential expired')
         }
         throw new Error(`unexpected ${path}`)
       }
@@ -71,36 +74,46 @@ test('401 and 403 move the page into the authorization state and post only to th
     const app = relay.mount()
 
     await app.settle()
-    assert.strictEqual(findAll(app.tree, node => node.props?.['data-connection'] === 'auth_required').length, 1, `${status} requires authorization`)
+    const channels = findAll(app.tree, node => node.props?.['data-lane'] === 'channels')[0]
+    const harnesses = findAll(app.tree, node => node.props?.['data-lane'] === 'harnesses')[0]
 
-    findButton(app.tree, 'Authorize Relay').props.onClick()
-    await app.settle()
-
-    assert.deepStrictEqual(
-      relay.calls.filter(call => call.path === '/connection/authorize'),
-      [{ options: { method: 'POST' }, path: '/connection/authorize' }]
-    )
+    assert.strictEqual(channels.props['data-connection'], 'auth_required', `${status} requires channel operator access`)
+    assert.strictEqual(harnesses.props['data-connection'], 'ready', 'channel auth does not downgrade harness auth')
+    assert.strictEqual(relay.calls.some(call => call.path.includes('/login/start')), false)
+    assert.strictEqual(findAll(app.tree, node => node.type === 'button' && textContent(node) === 'Authorize Relay').length, 0)
   }
 })
 
-test('a missing grant opens Relay and explains how authorization completes', async () => {
-  const relay = await loadRelay({
-    rest: async path => {
-      if (path === '/connection/status') return { status: 'auth_required' }
-      if (path === '/connection/authorize') throw responseError(401, 'grant required')
-      if (path === '/connection/onboarding') return { url: 'http://127.0.0.1:3456/' }
-      throw new Error(`unexpected ${path}`)
+function authRequiredChannelsRest(extra = {}) {
+  return async path => {
+    if (path === '/connection/status') {
+      return {
+        channels: { guidance: 'Channels need an operator-client credential.', status: 'auth_required' },
+        harnesses: { loginAvailable: true, status: 'ready' }
+      }
     }
-  })
+    if (path === '/connection/onboarding') return { url: 'http://127.0.0.1:3456/' }
+    if (path === '/harnesses') return { harnesses: [] }
+    if (Object.hasOwn(extra, path)) return extra[path]
+    throw new Error(`unexpected ${path}`)
+  }
+}
+
+test('a missing channel grant opens Relay and explains how authorization completes', async () => {
+  const relay = await loadRelay({ rest: authRequiredChannelsRest() })
   const app = relay.mount()
 
   await app.settle()
-  findButton(app.tree, 'Authorize Relay').props.onClick()
+  findButton(app.tree, 'Open Relay').props.onClick()
   await app.settle()
 
   assert.deepStrictEqual(relay.externalUrls, ['http://127.0.0.1:3456/'])
-  assert.match(textContent(app.tree), /approved scoped grant/)
-  assert.match(textContent(app.tree), /restart Hermes/)
+  assert.strictEqual(relay.calls.some(call => call.path === '/connection/authorize'), false, 'onboarding never redeems a grant from the renderer')
+  const note = findAll(app.tree, node => node.props?.['data-channel-setup'] === 'true')[0]
+
+  assert.ok(note, 'the channels lane explains how setup completes')
+  assert.match(textContent(note), /approved scoped grant/)
+  assert.match(textContent(note), /restart Hermes/)
 })
 
 test('failed Relay launch keeps the grant and restart recovery instructions', async () => {
@@ -108,23 +121,23 @@ test('failed Relay launch keeps the grant and restart recovery instructions', as
     openExternal: async () => {
       throw new Error('shell denied launch')
     },
-    rest: async path => {
-      if (path === '/connection/status') return { status: 'auth_required' }
-      if (path === '/connection/authorize') throw responseError(401, 'grant required')
-      if (path === '/connection/onboarding') return { url: 'http://127.0.0.1:3456/' }
-      throw new Error(`unexpected ${path}`)
-    }
+    rest: authRequiredChannelsRest()
   })
   const app = relay.mount()
 
   await app.settle()
-  findButton(app.tree, 'Authorize Relay').props.onClick()
+  findButton(app.tree, 'Open Relay').props.onClick()
   await app.settle()
 
-  assert.strictEqual(findAll(app.tree, node => node.props?.['data-connection'] === 'auth_required').length, 1)
-  assert.match(textContent(app.tree), /approved scoped grant/)
-  assert.match(textContent(app.tree), /restart Hermes/)
-  assert.match(textContent(app.tree), /could not be opened/)
+  const channels = findAll(app.tree, node => node.props?.['data-lane'] === 'channels')[0]
+
+  assert.strictEqual(channels.props['data-connection'], 'auth_required')
+  const note = findAll(app.tree, node => node.props?.['data-channel-setup'] === 'true')[0]
+
+  assert.ok(note, 'a failed launch still explains recovery')
+  assert.match(textContent(note), /approved scoped grant/)
+  assert.match(textContent(note), /restart Hermes/)
+  assert.match(textContent(note), /could not be opened/)
 })
 
 test('offline refresh preserves the stale transcript read-only and keeps the draft', async () => {
@@ -134,7 +147,10 @@ test('offline refresh preserves the stale transcript read-only and keeps the dra
     rest: async path => {
       if (path === '/connection/status') {
         statusChecks += 1
-        return statusChecks === 1 ? { status: 'ready' } : { status: 'offline' }
+        return {
+          channels: { guidance: '', status: statusChecks === 1 ? 'ready' : 'offline' },
+          harnesses: { loginAvailable: true, status: 'ready' }
+        }
       }
       if (path === '/channels') {
         return { channels: [{ id: 'general', name: 'General' }] }

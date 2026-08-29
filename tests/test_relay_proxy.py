@@ -24,6 +24,7 @@ from hermes_plugin_relay.relay_proxy import (
     _read_limited,
     project_history,
     validate_relay_base_url,
+    validate_relay_public_url,
 )
 
 
@@ -104,6 +105,36 @@ def test_loopback_root_urls_are_accepted(url, expected):
 def test_non_loopback_or_non_root_urls_are_rejected(url):
     with pytest.raises(RelayConfigurationError):
         validate_relay_base_url(url)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://relay.example.test", "https://relay.example.test"),
+        ("http://relay.example.test:3456/", "http://relay.example.test:3456"),
+        ("https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443"),
+    ],
+)
+def test_public_approval_root_urls_are_canonicalized(url, expected):
+    assert validate_relay_public_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://relay.example.test",
+        "https://user@relay.example.test",
+        "https://relay.example.test/approve",
+        "https://relay.example.test?q=1",
+        "https://relay.example.test#fragment",
+        "https://relay.example.test\\@evil.example",
+        "https://relay.example.test\n.evil.example",
+        "https://relay.example.test:99999",
+    ],
+)
+def test_public_approval_urls_reject_ambiguous_or_non_root_values(url):
+    with pytest.raises(RelayConfigurationError):
+        validate_relay_public_url(url)
 
 
 def test_transport_disables_ambient_proxies_and_redirects(monkeypatch):

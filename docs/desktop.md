@@ -31,9 +31,25 @@ stream.
 
 ## Frozen endpoints
 
-- `GET /connection/status` → `{ "status": "ready" | "offline" | "auth_required" | "error", "message"?: string }`
-- `GET /connection/onboarding` → `{ "url": "http://<literal-loopback>[:port]/" }` (credential-free setup target)
-- `POST /connection/authorize`
+- `GET /connection/status` reports both credential lanes independently:
+  ```json
+  {
+    "channels": {
+      "status": "ready | offline | auth_required | error",
+      "message": "optional safe detail",
+      "guidance": "channel operator setup guidance"
+    },
+    "harnesses": {
+      "status": "ready | offline | auth_required | error",
+      "message": "optional safe detail",
+      "loginAvailable": true
+    }
+  }
+  ```
+- `POST /connection/authorize` — legacy redemption of pre-provisioned channel
+  and actor grants; Desktop does not use it as a generic authorization action.
+- `GET /connection/onboarding` → `{ "url": "http://<literal-loopback>[:port]/" }`
+  (credential-free setup target Desktop opens from the channels lane)
 - `GET /channels`
 - `GET /channels/:id/messages?limit=50` (1–50 only)
 - `POST /channels/:id/messages`
@@ -44,6 +60,13 @@ These routes ride a separate scoped actor-token lane and return only projected,
 renderer-safe fields:
 
 - `GET /harnesses` → per-provider `{ provider, status, sessionCount, version? }`
+- `POST /harnesses/login/start` → starts Relay's browser/PIN actor flow and
+  returns only `{ status: "pending", verificationUrl, code, expiresAt }`.
+- `GET /harnesses/login` → `idle`, the same public `pending` projection,
+  `ready`, `denied`, `expired`, or `consumed`. On approval, the backend consumes
+  Relay's one-time token internally before returning `ready`.
+- `DELETE /harnesses/login` → forgets the process-local flow. Relay expires the
+  orphaned upstream flow on its normal short TTL.
 - `GET /harnesses/:provider/sessions` → bounded summaries (`id`, `title`,
   `cwd`, `preview`, `updatedAt`, `canWatch`, `redacted`), newest first.
   `cwd` is the harness's own recorded working directory, surfaced for
@@ -83,6 +106,12 @@ fragment. There is no CORS policy because this is a same-origin Hermes plugin
 backend. `localhost` is canonicalized to `127.0.0.1`, ambient proxies are
 disabled, and redirects are rejected before another credential-bearing hop.
 
+`RELAY_IDE_PUBLIC_URL` optionally supplies a distinct browser-visible root for
+the harness approval page, for example a tailnet hostname. It accepts only an
+HTTP/HTTPS root with no credentials, path, query, or fragment. This value is
+display-only: Relay API calls and every credential-bearing request continue to
+use the loopback-only `RELAY_IDE_URL`.
+
 `RELAY_IDE_OPERATOR_CLIENT_TOKEN` supplies an existing Relay operator-client
 credential. If that is absent, `POST /connection/authorize` may redeem the
 one-time `RELAY_IDE_OPERATOR_GRANT` using fixed generic client metadata and
@@ -106,10 +135,19 @@ same in-process-only, cleared-on-401/403 rules, and are auto-renewed ~2 min
 before expiry via `POST /cli-gateway/actor-credentials/renew` (the predecessor
 is never revoked, so a lost renew response can't lock the plugin out).
 
+When no actor token is live, Desktop's **Connect Harnesses** action starts
+Relay's `/cli-gateway/login` browser/PIN flow. The backend owns the flow id,
+polls Relay over loopback, and captures the approved `relay-sac-v1…` token
+exactly once. Renderer JavaScript receives only the approval URL, human code,
+expiry, and public flow state. This flow grants `session:read` with Relay's
+standard read task-ref; it cannot authorize `channels.*` and is never presented
+as channel authorization.
+
 Neither token nor grant is ever returned to Desktop JavaScript, included in a
-URL, written to config/files, placed in test fixtures, or logged by this
-backend. A missing, consumed, expired, or revoked credential/grant is reported
-as `auth_required`.
+production URL or config artifact, or logged by this backend. Boundary tests use
+synthetic markers only to prove they cannot cross renderer-facing responses. A
+missing, consumed, expired, or revoked credential/grant is reported as
+`auth_required`.
 
 Grant-backed onboarding requires an approved handshake grant with an exact
 `channelIds` scope. Relay inherits that scope when the issue request omits one;
@@ -117,9 +155,11 @@ the plugin cannot broaden or replace the approved channel set.
 
 ## Vertical-slice debt
 
-This is intentionally not set-and-forget authorization. Relay's current
+Channel authorization is intentionally not set-and-forget. Relay's current
 operator-client registry and this plugin credential holder are process-local;
 a Relay restart, plugin reload, credential expiry, or revocation requires a
-fresh approved grant or a newly supplied environment credential. There is no
-persistence, secret-store integration, automatic grant refresh, or event
-streaming in this slice.
+fresh approved channel grant or a newly supplied environment credential.
+Harnesses have browser/PIN onboarding and actor-token renewal, but the approved
+token still lives only in the backend process (or Relay CLI's existing token
+file when that source is used). There is no plugin-owned secret persistence or
+event streaming in this slice.

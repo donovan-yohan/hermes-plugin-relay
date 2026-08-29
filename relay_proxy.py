@@ -52,6 +52,9 @@ RELAY_ACTOR_TOKEN_FILE = os.path.expanduser("~/.config/relay-ide/actor-token.jso
 # Renew when <120s remain, matching the CLI's own threshold.
 ACTOR_RENEW_MARGIN_SECONDS = 120
 ACTOR_RENEW_COMMAND = "actor-credentials.renew"
+ACTOR_FILE_RECHECK_SECONDS = 5
+ACTOR_LOGIN_DISPLAY_NAME = "Relay desktop plugin"
+MAX_LOGIN_FLOW_ID_BYTES = 256
 
 
 class RelayProxyError(Exception):
@@ -131,6 +134,57 @@ def validate_relay_base_url(value: str) -> str:
     if port is not None:
         authority = f"{authority}:{port}"
     return f"http://{authority}"
+
+
+def validate_relay_public_url(value: str) -> str:
+    """Validate a display-only browser origin used for Relay login approval."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or any(
+            character.isspace()
+            or ord(character) < 0x20
+            or ord(character) == 0x7F
+            for character in value
+        )
+    ):
+        raise RelayConfigurationError()
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise RelayConfigurationError() from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or parsed.hostname is None
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        raise RelayConfigurationError()
+    host = parsed.hostname
+    authority = f"[{host}]" if ":" in host else host
+    if port is not None:
+        authority = f"{authority}:{port}"
+    return f"{parsed.scheme}://{authority}"
+
+
+def _iso_timestamp(value: Any) -> float:
+    if not isinstance(value, str):
+        raise RelayMalformedResponseError()
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError
+        return parsed.timestamp()
+    except ValueError as exc:
+        raise RelayMalformedResponseError() from exc
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -512,6 +566,23 @@ class ConnectionStatus:
         return result
 
 
+@dataclass(frozen=True)
+class HarnessLoginFlow:
+    flow_id: str
+    code: str
+    expires_at: str
+    deadline: float
+    verification_url: str
+
+    def to_wire(self) -> dict[str, str]:
+        return {
+            "status": "pending",
+            "code": self.code,
+            "expiresAt": self.expires_at,
+            "verificationUrl": self.verification_url,
+        }
+
+
 class RelayProxy:
     """Stateful only for an issued credential and unredeemed one-time grant."""
 
@@ -628,7 +699,7 @@ class RelayProxy:
         if self._configuration_error:
             return ConnectionStatus("error", "Relay URL is invalid")
         if self._active_credential() is None:
-            return ConnectionStatus("auth_required", "Relay authorization is required")
+            return ConnectionStatus("auth_required", "Channel authorization is required")
         try:
             project_channels(
                 self._channel_request(
@@ -636,7 +707,7 @@ class RelayProxy:
                 )
             )
         except RelayAuthRequiredError:
-            return ConnectionStatus("auth_required", "Relay authorization is required")
+            return ConnectionStatus("auth_required", "Channel authorization is required")
         except (RelayUnavailableError, RelayResponseTooLargeError):
             return ConnectionStatus("offline", "Relay is unavailable")
         except (RelayConfigurationError, RelayMalformedResponseError, RelayUpstreamError):
@@ -751,6 +822,7 @@ class ActorLaneClient:
         self,
         *,
         base_url: str = DEFAULT_RELAY_IDE_URL,
+        public_url: str | None = None,
         actor_token: str | None = None,
         grant: str | None = None,
         token_file: str | None = RELAY_ACTOR_TOKEN_FILE,
@@ -763,6 +835,15 @@ class ActorLaneClient:
         except RelayConfigurationError:
             self._base_url = ""
             self._configuration_error = True
+        self._login_configuration_error = False
+        if public_url:
+            try:
+                self._approval_base_url = validate_relay_public_url(public_url)
+            except RelayConfigurationError:
+                self._approval_base_url = ""
+                self._login_configuration_error = True
+        else:
+            self._approval_base_url = self._base_url
         self._transport = transport or UrlLibRelayTransport()
         self._clock = clock
         self._configured_token = actor_token if actor_token else None
@@ -778,9 +859,12 @@ class ActorLaneClient:
         self._file_token: str | None = None
         self._file_deadline: float | None = None
         self._file_checked = False
+        self._file_next_check = 0.0
         self._issued_token: str | None = None
         self._issued_deadline: float | None = None
         self._lock = threading.Lock()
+        self._login_lock = threading.Lock()
+        self._login_flow: HarnessLoginFlow | None = None
 
     @classmethod
     def from_environment(
@@ -789,12 +873,13 @@ class ActorLaneClient:
         env = os.environ if environment is None else environment
         return cls(
             base_url=env.get("RELAY_IDE_URL", DEFAULT_RELAY_IDE_URL),
+            public_url=env.get("RELAY_IDE_PUBLIC_URL"),
             actor_token=env.get("RELAY_IDE_ACTOR_TOKEN"),
             grant=env.get("RELAY_IDE_ACTOR_GRANT"),
         )
 
     def _load_file_token(self) -> tuple[str | None, float | None]:
-        """Read the `relay-ide login` credential file once per process life.
+        """Read the `relay-ide login` credential file under a short cache.
 
         Returns ``(token, deadline)`` or ``(None, None)``. The file's own
         ``expiresAt`` is authoritative; a missing/expired/loose-perms file
@@ -825,8 +910,8 @@ class ActorLaneClient:
         if not isinstance(expires_at, str):
             return None, None
         try:
-            deadline = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
-        except ValueError:
+            deadline = _iso_timestamp(expires_at)
+        except RelayMalformedResponseError:
             return None, None
         if deadline <= time.time():
             return None, None
@@ -859,16 +944,13 @@ class ActorLaneClient:
         new_credential = _mapping(issued.get("credential"))
         expires_at = new_credential.get("expiresAt")
         new_deadline = None
-        if isinstance(expires_at, str):
-            try:
-                wall_deadline = datetime.fromisoformat(
-                    expires_at.replace("Z", "+00:00")
-                ).timestamp()
-                # Convert wall-clock expiry to the monotonic domain so every
-                # consumer of _issued_deadline can compare against _clock().
-                new_deadline = self._clock() + max(0, wall_deadline - time.time())
-            except ValueError:
-                pass
+        try:
+            wall_deadline = _iso_timestamp(expires_at)
+            # Convert wall-clock expiry to the monotonic domain so every
+            # consumer of _issued_deadline can compare against _clock().
+            new_deadline = self._clock() + max(0, wall_deadline - time.time())
+        except RelayMalformedResponseError:
+            pass
         if new_deadline is None:
             new_deadline = self._clock() + ACTOR_CREDENTIAL_TTL_MS / 1000
         self._issued_token = new_token
@@ -890,12 +972,16 @@ class ActorLaneClient:
             ):
                 self._issued_token = None
                 self._issued_deadline = None
-            # Lazy-load the login file once, then cache its token+deadline.
-            if not self._file_checked:
+            # Re-check a missing login file on a short cadence so running
+            # `relay-ide login` after Desktop starts does not require a restart.
+            if not self._file_checked or (
+                self._file_token is None and self._clock() >= self._file_next_check
+            ):
                 file_token, file_deadline = self._load_file_token()
                 self._file_token = file_token
                 self._file_deadline = file_deadline
                 self._file_checked = True
+                self._file_next_check = self._clock() + ACTOR_FILE_RECHECK_SECONDS
             if (
                 self._file_token is not None
                 and self._file_deadline is not None
@@ -906,6 +992,7 @@ class ActorLaneClient:
                 # Allow a re-read: the operator may have run
                 # `relay-ide login` again while the old file token was live.
                 self._file_checked = False
+                self._file_next_check = 0.0
             return self._issued_token or self._configured_token or self._file_token
 
     def _clear_issued_token(self, token: str) -> None:
@@ -1043,6 +1130,156 @@ class ActorLaneClient:
             self._issued_deadline = self._clock() + ACTOR_CREDENTIAL_TTL_MS / 1000
         return ConnectionStatus("ready")
 
+    def status(self) -> ConnectionStatus:
+        """Probe only the read-only harness lane with its own credential."""
+
+        if self._configuration_error:
+            return ConnectionStatus("error", "Relay URL is invalid")
+        if self._active_token() is None:
+            if self._login_configuration_error:
+                return ConnectionStatus("error", "Relay public approval URL is invalid")
+            return ConnectionStatus("auth_required", "Harness authorization is required")
+        try:
+            self.harnesses()
+        except RelayAuthRequiredError:
+            return ConnectionStatus("auth_required", "Harness authorization is required")
+        except (RelayUnavailableError, RelayResponseTooLargeError):
+            return ConnectionStatus("offline", "Relay is unavailable")
+        except (RelayConfigurationError, RelayMalformedResponseError, RelayUpstreamError):
+            return ConnectionStatus("error", "Relay returned an invalid response")
+        return ConnectionStatus("ready")
+
+    def login_available(self) -> bool:
+        return not self._configuration_error and not self._login_configuration_error
+
+    def accept_login_credential(self, token: Any, credential: Any) -> None:
+        """Install one device-flow actor token without exposing it to callers."""
+
+        if not isinstance(token, str) or not token.startswith("relay-sac-v1."):
+            raise RelayMalformedResponseError()
+        record = _mapping(credential)
+        wall_deadline = _iso_timestamp(record.get("expiresAt"))
+        remaining = wall_deadline - time.time()
+        if remaining <= 0:
+            raise RelayMalformedResponseError()
+        with self._lock:
+            self._issued_token = token
+            self._issued_deadline = self._clock() + remaining
+
+    def start_login(self) -> dict[str, str]:
+        """Start Relay's browser/PIN flow and return only public approval data."""
+
+        if not self.login_available():
+            raise RelayConfigurationError()
+        if self._active_token() is not None:
+            return {"status": "ready"}
+        with self._login_lock:
+            if self._active_token() is not None:
+                return {"status": "ready"}
+            body = json.dumps(
+                {
+                    "actorId": ACTOR_CLIENT_ID,
+                    "displayName": ACTOR_LOGIN_DISPLAY_NAME,
+                    "capabilities": ["session:read"],
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            response = self._transport.request(
+                method="POST",
+                url=self._url("/cli-gateway/login/start"),
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                body=body,
+            )
+            if response.status_code < 200 or response.status_code >= 300:
+                if response.status_code >= 500:
+                    raise RelayUnavailableError()
+                raise RelayUpstreamError(response.status_code)
+            payload = _mapping(response.payload)
+            flow_id = _required_string(payload, "flowId")
+            code = _required_string(payload, "code")
+            expires_at = _required_string(payload, "expiresAt")
+            _required_string(payload, "verificationUrl")
+            deadline = _iso_timestamp(expires_at)
+            code_body = code[:4] + code[5:]
+            if (
+                len(flow_id.encode("utf-8")) > MAX_LOGIN_FLOW_ID_BYTES
+                or "/" in flow_id
+                or deadline <= time.time()
+                or len(code) != 9
+                or code[4:5] != "-"
+                or not all(
+                    character.isascii() and character.isalnum()
+                    for character in code_body
+                )
+                or code != code.upper()
+            ):
+                raise RelayMalformedResponseError()
+            flow = HarnessLoginFlow(
+                flow_id=flow_id,
+                code=code,
+                expires_at=expires_at,
+                deadline=deadline,
+                verification_url=(
+                    f"{self._approval_base_url}/cli-gateway/login/"
+                    f"{quote(flow_id, safe='')}/approve"
+                ),
+            )
+            self._login_flow = flow
+            return flow.to_wire()
+
+    def poll_login(self) -> dict[str, str]:
+        """Poll one flow; capture an approved token exactly once in-process."""
+
+        with self._login_lock:
+            if self._active_token() is not None:
+                self._login_flow = None
+                return {"status": "ready"}
+            flow = self._login_flow
+            if flow is None:
+                return {"status": "idle"}
+            if time.time() >= flow.deadline:
+                self._login_flow = None
+                return {"status": "expired", "message": "The Relay login code expired."}
+            response = self._transport.request(
+                method="GET",
+                url=self._url(f"/cli-gateway/login/{quote(flow.flow_id, safe='')}"),
+                headers={"Accept": "application/json"},
+                body=None,
+            )
+            if response.status_code == 404:
+                self._login_flow = None
+                return {"status": "expired", "message": "The Relay login code expired."}
+            if response.status_code < 200 or response.status_code >= 300:
+                if response.status_code >= 500:
+                    raise RelayUnavailableError()
+                raise RelayUpstreamError(response.status_code)
+            payload = _mapping(response.payload)
+            status = _required_string(payload, "status")
+            if status == "pending":
+                return flow.to_wire()
+            if status == "approved":
+                # Relay returns this token once. Clear the flow before validating
+                # so malformed one-shot material can never be polled/replayed.
+                self._login_flow = None
+                self.accept_login_credential(payload.get("token"), payload.get("credential"))
+                return {"status": "ready"}
+            if status in {"denied", "expired", "consumed"}:
+                self._login_flow = None
+                messages = {
+                    "denied": "Relay login was denied.",
+                    "expired": "The Relay login code expired.",
+                    "consumed": "This Relay login was already used. Start again.",
+                }
+                return {"status": status, "message": messages[status]}
+            raise RelayMalformedResponseError()
+
+    def cancel_login(self) -> dict[str, str]:
+        """Forget the local flow; Relay expires the orphaned flow shortly."""
+
+        with self._login_lock:
+            self._login_flow = None
+        return {"status": "ready" if self._active_token() is not None else "idle"}
+
     def harnesses(self) -> list[dict[str, Any]]:
         """Per-harness install rows with live session counts, hub-ordered."""
 
@@ -1131,7 +1368,9 @@ def reset_relay_proxy_for_tests(proxy: RelayProxy | None = None) -> None:
 __all__ = [
     "ACTOR_AUDIENCE",
     "ACTOR_CREDENTIAL_TTL_MS",
+    "ACTOR_FILE_RECHECK_SECONDS",
     "ACTOR_CLIENT_ID",
+    "ACTOR_LOGIN_DISPLAY_NAME",
     "ACTOR_READ_TASK_REF",
     "ACTOR_RENEW_COMMAND",
     "ACTOR_RENEW_MARGIN_SECONDS",
@@ -1141,6 +1380,7 @@ __all__ = [
     "MAX_CLIENT_MESSAGE_ID_BYTES",
     "MAX_HARNESS_SESSIONS",
     "MAX_HISTORY_LIMIT",
+    "MAX_LOGIN_FLOW_ID_BYTES",
     "MAX_MESSAGE_TEXT_BYTES",
     "MAX_RELAY_RESPONSE_BYTES",
     "MAX_SESSION_ID_BYTES",
@@ -1172,4 +1412,5 @@ __all__ = [
     "reset_actor_lane_for_tests",
     "reset_relay_proxy_for_tests",
     "validate_relay_base_url",
+    "validate_relay_public_url",
 ]

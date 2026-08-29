@@ -6,12 +6,16 @@ kind: standalone
 author: Nous Research
 description: >
   Native Hermes Desktop workspace for a local Relay hub. A loopback-only backend
-  owns the short-lived operator-client credential while the renderer lists
-  channels, shows transcripts, and posts messages. It exposes no provider or
-  participant runtime, Hermes tools, credential material, or fake stream.
+  keeps channel and harness credentials in separate lanes while the renderer
+  lists channels, shows transcripts, posts messages, and starts a browser/PIN
+  login for read-only harness access. It exposes no provider or participant
+  runtime, Hermes tools, credential material, or fake stream.
 
 requires_env: []
 optional_env:
   - RELAY_IDE_URL
+  - RELAY_IDE_PUBLIC_URL
   - RELAY_IDE_OPERATOR_CLIENT_TOKEN
   - RELAY_IDE_OPERATOR_GRANT
+  - RELAY_IDE_ACTOR_TOKEN
+  - RELAY_IDE_ACTOR_GRANT

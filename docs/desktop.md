@@ -46,6 +46,14 @@ stream.
     }
   }
   ```
+  Each lane proves itself with one cheap read on its own credential: the
+  channel lane lists channels, the harness lane reads `nodes.list`. The harness
+  probe deliberately does not list native sessions — that call makes Relay walk
+  every provider state root on disk (seconds on a real machine, unbounded in
+  the operator's session history), and this endpoint fires on Desktop mount and
+  on every Refresh. `nodes.list` sits on the same hub read-command allowlist,
+  resolves to the same `session:read` capability, and passes the same
+  scoped-actor middleware, so it proves the same thing about the credential.
 - `POST /connection/authorize` — legacy redemption of pre-provisioned channel
   and actor grants; Desktop does not use it as a generic authorization action.
 - `GET /connection/onboarding` → `{ "url": "http://<literal-loopback>[:port]/" }`

@@ -375,8 +375,17 @@ def test_status_probes_the_lane_without_listing_native_sessions():
             return pytest.fail("a status check must never list native sessions")
         assert call["url"].endswith(ACTOR_PROBE_PATH)
         assert call["method"] == "GET"
-        assert call["headers"]["x-relay-cli-command"] == ACTOR_PROBE_COMMAND
         assert call["body"] is None
+        # The probe rides the same lane with the same exact header set as every
+        # other actor read; no operator-client marker may bleed into it.
+        assert call["headers"] == {
+            "Accept": "application/json",
+            "x-relay-cli-gateway": "v1",
+            "x-relay-cli-command": ACTOR_PROBE_COMMAND,
+            "x-relay-cli-actor-token": "v1",
+            "x-relay-capabilities": "session:read",
+            "Authorization": "Bearer configured-sac",
+        }
         return probe_ok()
 
     lane, transport = make_lane(handler, actor_token="configured-sac")

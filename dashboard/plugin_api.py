@@ -6,6 +6,7 @@ its dashboard loader instead of using a relative import.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.util
 import json
@@ -23,6 +24,11 @@ router = APIRouter()
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _FALLBACK_PACKAGE = "hermes_plugin_relay"
 MAX_DESKTOP_REQUEST_BYTES = 64 * 1024
+CHANNEL_AUTH_GUIDANCE = (
+    "Configure RELAY_IDE_OPERATOR_CLIENT_TOKEN or an approved channel-scoped "
+    "RELAY_IDE_OPERATOR_GRANT on the Hermes gateway. Relay Login connects "
+    "harnesses only."
+)
 
 
 def _plugin_package_name() -> str:
@@ -215,7 +221,17 @@ def _native_session_id(value: str) -> str:
 
 @router.get("/connection/status")
 async def connection_status() -> Any:
-    return (await run_in_threadpool(_proxy().status)).to_wire()
+    proxy = _proxy()
+    actor_lane = _actor_lane()
+    channel_status, harness_status = await asyncio.gather(
+        run_in_threadpool(proxy.status),
+        run_in_threadpool(actor_lane.status),
+    )
+    channels = channel_status.to_wire()
+    channels["guidance"] = CHANNEL_AUTH_GUIDANCE
+    harnesses: dict[str, Any] = harness_status.to_wire()
+    harnesses["loginAvailable"] = actor_lane.login_available()
+    return {"channels": channels, "harnesses": harnesses}
 
 
 @router.get("/connection/onboarding")
@@ -283,6 +299,46 @@ async def list_harnesses() -> Any:
         return {"harnesses": rows}
     except RelayProxyError as error:
         return _relay_error(error)
+
+
+@router.post("/harnesses/login/start")
+async def start_harness_login(request: Request) -> Any:
+    try:
+        if await _read_request_body(request):
+            raise RequestValidationError(
+                400, "invalid_body", "Harness login does not accept a body"
+            )
+        return await run_in_threadpool(_actor_lane().start_login)
+    except RequestValidationError as error:
+        return _error(error.status_code, error.code, error.message)
+    except RelayConfigurationError:
+        return _error(
+            500,
+            "relay_login_unavailable",
+            "Relay Login is not configured",
+        )
+    except RelayProxyError as error:
+        return _relay_error(error)
+
+
+@router.get("/harnesses/login")
+async def poll_harness_login() -> Any:
+    try:
+        return await run_in_threadpool(_actor_lane().poll_login)
+    except RelayProxyError as error:
+        return _relay_error(error)
+
+
+@router.delete("/harnesses/login")
+async def cancel_harness_login(request: Request) -> Any:
+    try:
+        if await _read_request_body(request):
+            raise RequestValidationError(
+                400, "invalid_body", "Harness login cancel does not accept a body"
+            )
+        return await run_in_threadpool(_actor_lane().cancel_login)
+    except RequestValidationError as error:
+        return _error(error.status_code, error.code, error.message)
 
 
 @router.get("/harnesses/{provider}/sessions")

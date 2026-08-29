@@ -79,11 +79,19 @@ def install_proxy(
     return transport
 
 
-def install_actor_lane(api_module, handler, *, actor_token=None, grant=None):
+def install_actor_lane(
+    api_module, handler, *, actor_token=None, grant=None, public_url=None
+):
     from hermes_plugin_relay.relay_proxy import ActorLaneClient
 
     transport = RecordingTransport(handler)
-    lane = ActorLaneClient(actor_token=actor_token, grant=grant, transport=transport, token_file=None)
+    lane = ActorLaneClient(
+        actor_token=actor_token,
+        grant=grant,
+        public_url=public_url,
+        transport=transport,
+        token_file=None,
+    )
     api_module._proxy_mod.reset_actor_lane_for_tests(lane)
     return transport
 
@@ -102,12 +110,21 @@ def test_status_and_channel_routes_use_only_safe_projected_data(client, api_modu
     def handler(**call):
         if call["url"].endswith("/channels"):
             return RelayHttpResponse(200, channel_list())
+        if call["url"].endswith("/sessions/native"):
+            return RelayHttpResponse(200, {"sessions": [], "providers": []})
         if call["method"] == "GET":
             return RelayHttpResponse(200, {"messages": [message()]})
         return RelayHttpResponse(201, {"message": message(), "run": {"id": "chrun:not-for-desktop"}})
 
     transport = install_proxy(api_module, handler)
-    assert client.get(f"{PREFIX}/connection/status").json() == {"status": "ready"}
+    install_actor_lane(api_module, handler, actor_token="configured-sac")
+    assert client.get(f"{PREFIX}/connection/status").json() == {
+        "channels": {
+            "status": "ready",
+            "guidance": api_module.CHANNEL_AUTH_GUIDANCE,
+        },
+        "harnesses": {"status": "ready", "loginAvailable": True},
+    }
     channels = client.get(f"{PREFIX}/channels")
     assert channels.status_code == 200
     assert channels.json() == channel_list()
@@ -129,6 +146,79 @@ def test_status_and_channel_routes_use_only_safe_projected_data(client, api_modu
         "clientMessageId": "desktop:retry:1",
     }
     assert "access-control-allow-origin" not in posted.headers
+
+
+def test_connection_status_keeps_channel_and_harness_auth_independent(client, api_module):
+    channel_transport = install_proxy(
+        api_module,
+        lambda **_call: pytest.fail("an unconfigured channel lane must not dial"),
+        credential=None,
+    )
+    install_actor_lane(
+        api_module,
+        lambda **_call: RelayHttpResponse(200, {"sessions": [], "providers": []}),
+        actor_token="configured-sac",
+    )
+    response = client.get(f"{PREFIX}/connection/status")
+    assert response.status_code == 200
+    assert response.json() == {
+        "channels": {
+            "status": "auth_required",
+            "message": "Channel authorization is required",
+            "guidance": api_module.CHANNEL_AUTH_GUIDANCE,
+        },
+        "harnesses": {"status": "ready", "loginAvailable": True},
+    }
+    assert channel_transport.calls == []
+
+    install_proxy(
+        api_module,
+        lambda **call: RelayHttpResponse(200, channel_list())
+        if call["url"].endswith("/channels")
+        else pytest.fail(f"unexpected channel call {call['url']}"),
+    )
+    harness_transport = install_actor_lane(
+        api_module,
+        lambda **_call: pytest.fail("an unconfigured harness lane must not dial"),
+    )
+    response = client.get(f"{PREFIX}/connection/status")
+    assert response.json()["channels"]["status"] == "ready"
+    assert response.json()["harnesses"] == {
+        "status": "auth_required",
+        "message": "Harness authorization is required",
+        "loginAvailable": True,
+    }
+    assert harness_transport.calls == []
+
+
+def test_connection_status_disables_login_for_an_invalid_public_url(client, api_module):
+    install_proxy(
+        api_module,
+        lambda **_call: pytest.fail("unconfigured channel lane must not dial"),
+        credential=None,
+    )
+    transport = install_actor_lane(
+        api_module,
+        lambda **_call: pytest.fail("invalid login configuration must not dial"),
+        public_url="https://relay.example.test/approve",
+    )
+
+    response = client.get(f"{PREFIX}/connection/status")
+    assert response.json()["harnesses"] == {
+        "status": "error",
+        "message": "Relay public approval URL is invalid",
+        "loginAvailable": False,
+    }
+    start = client.post(f"{PREFIX}/harnesses/login/start")
+    assert start.status_code == 500
+    assert start.json() == {
+        "error": {
+            "code": "relay_login_unavailable",
+            "message": "Relay Login is not configured",
+            "retryable": False,
+        }
+    }
+    assert transport.calls == []
 
 
 def test_authorize_never_returns_grant_or_issued_credential(client, api_module):
@@ -189,6 +279,122 @@ def test_connection_onboarding_returns_only_the_configured_relay_root(client, ap
 
     assert response.status_code == 200
     assert response.json() == {"url": "http://[::1]:4567/"}
+
+
+def test_harness_login_routes_never_return_the_approved_token(client, api_module):
+    secret = "relay-sac-v1.api-device-secret"
+    flow_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    poll_count = 0
+
+    def handler(**call):
+        nonlocal poll_count
+        if call["url"].endswith("/cli-gateway/login/start"):
+            return RelayHttpResponse(
+                201,
+                {
+                    "flowId": flow_id,
+                    "code": "Q7CV-EH8Y",
+                    "expiresAt": "2099-01-01T00:00:00.000Z",
+                    "verificationUrl": (
+                        f"http://127.0.0.1:3456/cli-gateway/login/{flow_id}/approve"
+                    ),
+                },
+            )
+        if call["url"].endswith(f"/cli-gateway/login/{flow_id}"):
+            poll_count += 1
+            if poll_count == 1:
+                return RelayHttpResponse(200, {"status": "pending"})
+            return RelayHttpResponse(
+                200,
+                {
+                    "status": "approved",
+                    "token": secret,
+                    "credential": {
+                        "id": "sac:private-record",
+                        "audience": "relay:cli-gateway:v1",
+                        "capabilities": ["session:read"],
+                        "expiresAt": "2099-01-01T00:00:00.000Z",
+                    },
+                },
+            )
+        if call["url"].endswith("/sessions/native"):
+            return RelayHttpResponse(200, {"sessions": [], "providers": []})
+        return pytest.fail(f"unexpected Relay call {call['url']}")
+
+    transport = install_actor_lane(
+        api_module,
+        handler,
+        public_url="https://dev.example.test",
+    )
+    started = client.post(f"{PREFIX}/harnesses/login/start")
+    assert started.status_code == 200
+    assert started.json() == {
+        "status": "pending",
+        "code": "Q7CV-EH8Y",
+        "expiresAt": "2099-01-01T00:00:00.000Z",
+        "verificationUrl": (
+            f"https://dev.example.test/cli-gateway/login/{flow_id}/approve"
+        ),
+    }
+    # The browser-visible root is display-only: assert the exact request origin,
+    # since an `endswith` check would pass for either base URL.
+    assert transport.calls[0]["url"] == "http://127.0.0.1:3456/cli-gateway/login/start"
+    assert json.loads(transport.calls[0]["body"]) == {
+        "actorId": "desktop-plugin-harness-view",
+        "displayName": "Relay desktop plugin",
+        "capabilities": ["session:read"],
+    }
+
+    pending = client.get(f"{PREFIX}/harnesses/login")
+    approved = client.get(f"{PREFIX}/harnesses/login")
+    already_ready = client.get(f"{PREFIX}/harnesses/login")
+    assert pending.json() == started.json()
+    assert approved.json() == {"status": "ready"}
+    assert already_ready.json() == {"status": "ready"}
+    assert poll_count == 2
+    for response in (started, pending, approved, already_ready):
+        assert secret not in response.text
+        assert "sac:private-record" not in response.text
+
+    harnesses = client.get(f"{PREFIX}/harnesses")
+    assert harnesses.status_code == 200
+    assert transport.calls[-1]["headers"]["Authorization"] == f"Bearer {secret}"
+    assert all(
+        call["url"].startswith("http://127.0.0.1:3456/") for call in transport.calls
+    )
+
+
+def test_harness_login_rejects_bodies_and_cancel_forgets_the_flow(client, api_module):
+    flow_id = "11111111-2222-3333-4444-555555555555"
+
+    def handler(**call):
+        if call["url"].endswith("/cli-gateway/login/start"):
+            return RelayHttpResponse(
+                201,
+                {
+                    "flowId": flow_id,
+                    "code": "ABCD-1234",
+                    "expiresAt": "2099-01-01T00:00:00.000Z",
+                    "verificationUrl": (
+                        f"http://127.0.0.1:3456/cli-gateway/login/{flow_id}/approve"
+                    ),
+                },
+            )
+        return pytest.fail("cancelled flow must not be polled")
+
+    transport = install_actor_lane(api_module, handler)
+    rejected = client.post(f"{PREFIX}/harnesses/login/start", json={})
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == "invalid_body"
+    assert transport.calls == []
+
+    assert client.post(f"{PREFIX}/harnesses/login/start").status_code == 200
+    rejected_cancel = client.request(
+        "DELETE", f"{PREFIX}/harnesses/login", json={}
+    )
+    assert rejected_cancel.status_code == 400
+    assert client.delete(f"{PREFIX}/harnesses/login").json() == {"status": "idle"}
+    assert client.get(f"{PREFIX}/harnesses/login").json() == {"status": "idle"}
 
 
 @pytest.mark.parametrize(

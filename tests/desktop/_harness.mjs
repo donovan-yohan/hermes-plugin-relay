@@ -71,6 +71,7 @@ function component(tag, extra = {}) {
 function createSdk(host) {
   return {
     Button: component('button'),
+    CopyButton: component('copy-button'),
     EmptyState: props => jsx('empty-state', props),
     ErrorState: props => jsx('error-state', props),
     host,
@@ -206,7 +207,10 @@ export async function loadRelay({
   openExternal,
   post,
   rest,
-  status = { status: 'ready' },
+  status = {
+    channels: { guidance: '', status: 'ready' },
+    harnesses: { loginAvailable: true, status: 'ready' }
+  },
   storedSelection = '',
   workspaceSupported = true
 } = {}) {
@@ -224,6 +228,12 @@ export async function loadRelay({
   const workspaceOpenings = []
   let paneVisible = false
   let timerId = 0
+  const connectionFixture = value => value?.channels && value?.harnesses
+    ? value
+    : {
+        channels: { guidance: '', ...value },
+        harnesses: { loginAvailable: true, ...value }
+      }
   const nonce = `relay-${sequence++}`
   const setIntervalStub = (callback, delay) => {
     const id = ++timerId
@@ -275,7 +285,7 @@ export async function loadRelay({
 
   const prelude = `const __relay = globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}]\n`
   let code = SOURCE
-    .replace(SDK_IMPORT, `${prelude}const { Button, EmptyState, ErrorState, host, Loader, ROUTES_AREA, StatusDot, Textarea, cn } = __relay.sdk\n`)
+    .replace(SDK_IMPORT, `${prelude}const { Button, CopyButton, EmptyState, ErrorState, host, Loader, ROUTES_AREA, StatusDot, Textarea, cn } = __relay.sdk\n`)
     .replace(REACT_IMPORT, `const { useCallback, useEffect, useRef, useState } = globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}].hooks\n`)
     .replace(JSX_IMPORT, `const { jsx, jsxs } = globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}].jsxRuntime\n`)
     .replace(/\bsetInterval\(/g, `globalThis.__RELAY_DESKTOP_TEST__[${JSON.stringify(nonce)}].timers.setIntervalStub(`)
@@ -308,14 +318,16 @@ export async function loadRelay({
     rest: async (path, options = {}) => {
       calls.push({ options, path })
       if (rest) {
-        return rest(path, options, calls)
+        const response = await rest(path, options, calls)
+
+        return path === '/connection/status' ? connectionFixture(response) : response
       }
 
       if (path === '/connection/status') {
-        return typeof status === 'function' ? status() : status
+        return connectionFixture(typeof status === 'function' ? status() : status)
       }
-      if (path === '/connection/authorize') {
-        return { ok: true }
+      if (path === '/harnesses/login') {
+        return { status: 'idle' }
       }
       if (path === '/channels') {
         return { channels }

@@ -1,7 +1,7 @@
 {
   "name": "hermes-plugin-relay",
   "label": "Relay Workspace",
-  "description": "Loopback credential proxy for the native Relay workspace in Hermes Desktop.",
+  "description": "Split channel/harness credential proxy for the native Relay workspace in Hermes Desktop.",
   "icon": "MessagesSquare",
   "version": "0.2.0.dev0",
   "api": "plugin_api.py"
